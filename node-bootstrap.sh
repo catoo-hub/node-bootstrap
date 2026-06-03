@@ -935,6 +935,89 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION 9b · WILDCARD DNS A RECORD via Cloudflare API
+# Creates `*.${DOMAIN} → ${NODE_PUBLIC_IP}` so any rotated SNI subdomain
+# resolves to this node. Required for browser-based selfsteal tests and for
+# Xray clients that do DNS validation on SNI. Reality proxy traffic itself
+# connects by IP so doesn't strictly need DNS, but having a real A record
+# makes the SNI subdomain look "real" to DPI as well.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Find the Cloudflare zone that covers the given DOMAIN.
+# Walks up the labels (target.kitsura.fun → kitsura.fun → fun) and stops at
+# the first one the CF_TOKEN can see in /zones?name=...
+_cf_find_zone_id() {
+    local d="$DOMAIN"
+    while [[ "$d" == *.* ]]; do
+        local resp; resp="$(curl -fsS --max-time 10 \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            "https://api.cloudflare.com/client/v4/zones?name=${d}" 2>/dev/null)" || resp=""
+        local zid; zid="$(echo "$resp" | jq -r '.result[0].id // empty' 2>/dev/null)"
+        if [[ -n "$zid" ]]; then
+            echo "${zid}|${d}"
+            return 0
+        fi
+        d="${d#*.}"  # strip leftmost label
+    done
+    return 1
+}
+
+setup_wildcard_dns() {
+    log_step "Creating wildcard DNS A record *.${DOMAIN} → ${NODE_PUBLIC_IP}"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Cloudflare API: upsert *.${DOMAIN} A → ${NODE_PUBLIC_IP}"; STEP_STATUS["wildcard_dns"]="DRY"; return 0; }
+
+    local zone_info; zone_info="$(_cf_find_zone_id)" || {
+        log_error "Could not find Cloudflare zone for '${DOMAIN}' — is the CF token scoped to a parent zone?"
+        STEP_STATUS["wildcard_dns"]="FAILED"
+        return 1
+    }
+    local zone_id="${zone_info%|*}"
+    local zone_name="${zone_info##*|}"
+    log_info "Cloudflare zone: ${zone_name} (id: ${zone_id})"
+
+    # Check if record already exists
+    local record_name="*.${DOMAIN}"
+    local existing; existing="$(curl -fsS --max-time 10 \
+        -H "Authorization: Bearer ${CF_TOKEN}" \
+        "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=A&name=${record_name}")"
+    local rec_id; rec_id="$(echo "$existing" | jq -r '.result[0].id // empty')"
+
+    # `proxied: false` is CRITICAL — Reality needs a direct TCP connection to
+    # the node. With CF proxy ON, all traffic goes through Cloudflare's edge
+    # which strips Reality's TLS handshake characteristics.
+    local body
+    body="$(jq -n --arg name "$record_name" --arg ip "$NODE_PUBLIC_IP" \
+        '{type: "A", name: $name, content: $ip, proxied: false, ttl: 1}')"
+
+    local resp
+    if [[ -n "$rec_id" ]]; then
+        log_info "Wildcard record exists — updating to point at ${NODE_PUBLIC_IP}"
+        resp="$(curl -fsS --max-time 10 -X PUT \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${rec_id}" \
+            -d "$body")"
+    else
+        log_info "Creating new wildcard record"
+        resp="$(curl -fsS --max-time 10 -X POST \
+            -H "Authorization: Bearer ${CF_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records" \
+            -d "$body")"
+    fi
+
+    if [[ "$(echo "$resp" | jq -r '.success // false')" != "true" ]]; then
+        log_error "Cloudflare API rejected the DNS write:"
+        echo "$resp" | jq '.errors // .' 2>/dev/null | sed 's/^/    [cf-api] /' >&2
+        STEP_STATUS["wildcard_dns"]="FAILED"
+        return 1
+    fi
+
+    log_ok "Wildcard DNS record live: *.${DOMAIN} → ${NODE_PUBLIC_IP} (proxied=false)"
+    STEP_STATUS["wildcard_dns"]="OK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 10 · NGINX SELFSTEAL — unix socket + XHTTP gRPC + reject default
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -994,6 +1077,25 @@ ssl_prefer_server_ciphers on;
 ssl_session_timeout 1d;
 ssl_session_cache shared:MozSSL:10m;
 ssl_session_tickets off;
+
+# HTTP → HTTPS redirect on port 80 (no proxy_protocol — direct TCP).
+# Nginx in host network mode can bind 0.0.0.0:80 directly.
+# Xray Reality only owns 443, so 80 is free for nginx.
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    # ACME HTTP-01 fallback (we use DNS-01 by default but keep this just in case)
+    location /.well-known/acme-challenge/ {
+        root /var/www/html;
+        try_files \$uri =404;
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
 
 server {
     listen unix:${NGINX_SOCK} ssl proxy_protocol;
@@ -1872,6 +1974,7 @@ main() {
     setup_fail2ban
     install_docker
     setup_cert
+    setup_wildcard_dns
     setup_nginx_selfsteal
 
     if [[ "$USE_EXISTING_NODE" == false ]]; then

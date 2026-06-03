@@ -736,7 +736,20 @@ setup_ssh() {
     local sp; sp="$(_get_ssh_port)"
     log_info "SSH port: ${sp}"
     [[ "$DRY_RUN" == true ]] && { log_dry "Would harden SSH"; STEP_STATUS["ssh"]="DRY"; return 0; }
-    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+
+    # Only flip PermitRootLogin to prohibit-password (= key-only) if root has
+    # at least one authorized SSH key on disk. Otherwise we'd lock the operator
+    # out the moment ssh reloads — exactly what happened to the first test
+    # install on this project.
+    if [[ -s /root/.ssh/authorized_keys ]]; then
+        sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+        log_info "PermitRootLogin → prohibit-password (root key present)"
+    else
+        log_warn "No /root/.ssh/authorized_keys — leaving PermitRootLogin as-is to avoid lockout"
+        log_warn "To harden later: add a key, then:"
+        log_warn "  sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config && systemctl reload ssh"
+    fi
+
     sed -i 's/^#*X11Forwarding.*/X11Forwarding no/'                       /etc/ssh/sshd_config
     sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 60/'           /etc/ssh/sshd_config
     if sshd -t 2>/dev/null; then

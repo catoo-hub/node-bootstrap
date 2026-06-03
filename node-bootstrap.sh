@@ -407,6 +407,24 @@ reality_keygen() {
     echo "${priv}|${pub}"
 }
 
+# state_load — if a previous install left ${CONFIG_FILE} on disk, source it
+# so re-runs reuse the SAME XHTTP_PATH, SHORT_IDs, Reality keys, Hysteria
+# passwords, STUB_NAME, NODE_NAME, sequence, etc. Without this, every
+# re-install picks new random values for those fields and they desync from
+# the host records already created in the panel (this is what caused the
+# XHTTP 405 — nginx had path A, host record had path B, both random,
+# different runs).
+state_load() {
+    [[ -f "$CONFIG_FILE" ]] || return 1
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    if [[ -f "${STATE_DIR}/secrets.env" ]]; then
+        # shellcheck disable=SC1091
+        source "${STATE_DIR}/secrets.env"
+    fi
+    return 0
+}
+
 state_save() {
     mkdir -p "$STATE_DIR"
     cat > "$CONFIG_FILE" <<EOF
@@ -534,6 +552,14 @@ panel_create_host() {
 collect_params() {
     log_step "Collecting installation parameters"
 
+    # 0. Resume previous values from state if present. CLI flags override these;
+    #    only fields the operator didn't pass get the persisted value. Critical
+    #    for re-runs — keeps XHTTP_PATH / SHORT_ID_* / Reality keys / passwords
+    #    stable so panel-side host records keep matching the on-server config.
+    if state_load 2>/dev/null; then
+        log_info "Loaded previous install state from ${CONFIG_FILE}"
+    fi
+
     # 1. DOMAIN
     if [[ -z "$DOMAIN" ]]; then
         [[ "$NON_INTERACTIVE" == true ]] && { log_error "--domain is required"; exit 1; }
@@ -631,7 +657,11 @@ collect_params() {
     fi
 
     # 9. XHTTP path
-    XHTTP_PATH="${XHTTP_PATH_POOL[$RANDOM % ${#XHTTP_PATH_POOL[@]}]}"
+    # Pick XHTTP path only on first install — re-runs must reuse the existing
+    # one so nginx config and panel host record stay in sync (see state_load).
+    if [[ -z "${XHTTP_PATH:-}" ]]; then
+        XHTTP_PATH="${XHTTP_PATH_POOL[$RANDOM % ${#XHTTP_PATH_POOL[@]}]}"
+    fi
 
     log_info "DOMAIN  : ${DOMAIN}"
     log_info "NODE    : ${NODE_NAME}  $(country_flag "$COUNTRY_CODE") $(country_name "$COUNTRY_CODE")"
@@ -1143,7 +1173,10 @@ EOF
     # Templates live in templates/stubs/<name>.html in the repo.
     # If running from a local clone, copy directly. Otherwise download from RAW_BASE.
     local stub_templates=(realestate sushi analytics apidocs blog portfolio)
-    STUB_NAME="${stub_templates[$RANDOM % ${#stub_templates[@]}]}"
+    # Sticky: re-runs keep the same stub so the visible site doesn't change.
+    if [[ -z "${STUB_NAME:-}" ]]; then
+        STUB_NAME="${stub_templates[$RANDOM % ${#stub_templates[@]}]}"
+    fi
     log_info "Selfsteal stub: ${STUB_NAME}"
 
     local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
@@ -1207,6 +1240,21 @@ generate_secrets() {
     log_step "Generating Reality keypairs + Hysteria passwords"
     [[ "$DRY_RUN" == true ]] && { log_dry "x25519 + openssl rand"; STEP_STATUS["secrets"]="DRY"; return 0; }
 
+    # Sticky-secret guard: if state_load brought existing values back from
+    # a previous install, skip regenerating them. Re-runs MUST reuse the same
+    # Reality keypairs, shortIds, and Hysteria passwords — otherwise the host
+    # records already in the panel point at stale crypto and stop working.
+    local need_keys=false
+    [[ -z "${REALITY_PRIV_TCP:-}" || -z "${REALITY_PUB_TCP:-}" ]] && need_keys=true
+    [[ -z "${REALITY_PRIV_GRPC:-}" || -z "${REALITY_PUB_GRPC:-}" ]] && need_keys=true
+    if [[ "$need_keys" != true \
+       && -n "${SHORT_ID_TCP:-}" && -n "${SHORT_ID_GRPC:-}" \
+       && -n "${HYS_PASSWORD:-}" && -n "${HYS_OBFS_PASSWORD:-}" ]]; then
+        log_info "Reusing existing keys/secrets from state"
+        STEP_STATUS["secrets"]="SKIPPED(state)"
+        return 0
+    fi
+
     log_info "Pulling node image (needed for xray x25519 keygen)..."
     docker pull "$NODE_IMAGE" 2>&1 | tail -2 | sed 's/^/    [pull] /' || {
         log_error "Failed to pull node image"
@@ -1214,24 +1262,23 @@ generate_secrets() {
         return 1
     }
 
-    log_info "Generating Reality keypair (TCP inbound)..."
-    local kp; kp="$(reality_keygen)" || return 1
-    REALITY_PRIV_TCP="${kp%%|*}"
-    REALITY_PUB_TCP="${kp##*|}"
+    if [[ -z "${REALITY_PRIV_TCP:-}" || -z "${REALITY_PUB_TCP:-}" ]]; then
+        log_info "Generating Reality keypair (TCP inbound)..."
+        local kp; kp="$(reality_keygen)" || return 1
+        REALITY_PRIV_TCP="${kp%%|*}"
+        REALITY_PUB_TCP="${kp##*|}"
+    fi
+    if [[ -z "${REALITY_PRIV_GRPC:-}" || -z "${REALITY_PUB_GRPC:-}" ]]; then
+        log_info "Generating Reality keypair (gRPC inbound)..."
+        local kp; kp="$(reality_keygen)" || return 1
+        REALITY_PRIV_GRPC="${kp%%|*}"
+        REALITY_PUB_GRPC="${kp##*|}"
+    fi
 
-    log_info "Generating Reality keypair (gRPC inbound)..."
-    kp="$(reality_keygen)" || return 1
-    REALITY_PRIV_GRPC="${kp%%|*}"
-    REALITY_PUB_GRPC="${kp##*|}"
-
-    HYS_PASSWORD="$(gen_password)"
-    HYS_OBFS_PASSWORD="$(gen_password)"
-
-    # Reality shortIds — 8 bytes (16 hex chars), per inbound.
-    # On the server side this restricts which client shortIds are accepted;
-    # on the client side it must be present in vless:// as `sid=...`.
-    SHORT_ID_TCP="$(openssl rand -hex 8)"
-    SHORT_ID_GRPC="$(openssl rand -hex 8)"
+    [[ -z "${HYS_PASSWORD:-}" ]]      && HYS_PASSWORD="$(gen_password)"
+    [[ -z "${HYS_OBFS_PASSWORD:-}" ]] && HYS_OBFS_PASSWORD="$(gen_password)"
+    [[ -z "${SHORT_ID_TCP:-}" ]]      && SHORT_ID_TCP="$(openssl rand -hex 8)"
+    [[ -z "${SHORT_ID_GRPC:-}" ]]     && SHORT_ID_GRPC="$(openssl rand -hex 8)"
 
     log_ok "Secrets generated"
     STEP_STATUS["secrets"]="OK"

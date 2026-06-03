@@ -100,7 +100,7 @@ sudo bash node-bootstrap.sh \
 | `--country <CC>` | (required) | ISO-2 код страны |
 | `--hosting <s>` | — | hosting suffix (1CENT, HETZNER) |
 | `--seq <NN>` | auto-detect | sequence number |
-| `--node-port <p>` | `2222` | панель ↔ нода control port |
+| `--node-port <p>` | `60000` | панель ↔ нода control port |
 | `--rotation-days <n>` | `3` | каденс ротации |
 | `--active-snis <n>` | `3` | сколько SNI держать живыми |
 | `--sni-style` | `cdn` | `cdn` \| `words` \| `hex` |

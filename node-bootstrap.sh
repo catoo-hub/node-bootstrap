@@ -86,7 +86,10 @@ SNI_STYLE="cdn"            # cdn | words | hex
 DEFAULT_FP="randomized"    # randomized | chrome | firefox | safari | ios | android | edge | qq
 
 # Node container
-NODE_PORT="2222"           # rw-node ↔ panel control port
+# Default to a high "looks like ephemeral / app port" range. 2222 (SSH alt) and
+# 3000 (web dev) stand out in scanner logs. 61000 is taken by XTLS_API_PORT
+# inside the container, so use 60000.
+NODE_PORT="60000"          # rw-node ↔ panel control port
 
 # Reality keys — generated per inbound (TCP + gRPC use SEPARATE keypairs)
 REALITY_PRIV_TCP=""
@@ -901,9 +904,8 @@ setup_cert() {
         log_ok "Wildcard cert installed"
     fi
 
-    # Compat symlink for Hysteria2 config (uses /etc/nginx/ssl/<domain>/ paths)
-    mkdir -p "/etc/nginx/ssl"
-    ln -sfn "${NGINX_DIR}/ssl" "/etc/nginx/ssl/${DOMAIN}" 2>/dev/null || true
+    # (no host-side symlink needed: the node container gets the cert via
+    # ${NGINX_DIR}/ssl → /etc/xray/cert mount declared in setup_node)
 
     # Manual renew helper
     cat > "$CERT_RENEW_BIN" <<EOF
@@ -1128,8 +1130,11 @@ build_xray_config() {
     local tag_grpc="${tag_main}-GRPC"
     local tag_xhttp="${tag_main}-XHTTP"
     local tag_hys="${tag_main}-HYS"
-    local hys_cert="/etc/nginx/ssl/${DOMAIN}/fullchain.pem"
-    local hys_key="/etc/nginx/ssl/${DOMAIN}/privkey.pem"
+    # Hysteria2 cert paths AS SEEN FROM INSIDE the node container.
+    # node-bootstrap mounts /opt/web/nginx/ssl → /etc/xray/cert (read-only)
+    # so Xray can read the same wildcard cert that nginx serves.
+    local hys_cert="/etc/xray/cert/fullchain.pem"
+    local hys_key="/etc/xray/cert/privkey.pem"
 
     jq -n \
         --arg t1 "$tag_main" --arg t2 "$tag_grpc" --arg t3 "$tag_xhttp" --arg t4 "$tag_hys" \
@@ -1490,6 +1495,10 @@ services:
         hard: 1048576
     volumes:
       - /dev/shm:/dev/shm
+      # Mount the wildcard cert so Xray (running inside this container) can
+      # read it for the Hysteria2 inbound's tlsSettings. Nginx serves the same
+      # files from its own /etc/nginx/ssl mount.
+      - ${NGINX_DIR}/ssl:/etc/xray/cert:ro
     logging:
       driver: json-file
       options:

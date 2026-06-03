@@ -1,0 +1,12 @@
+# Force LF for all shell scripts and config files — CRLF breaks bash on Linux
+*.sh        text eol=lf
+node-bootstrap.sh  text eol=lf
+web-sni-rotate     text eol=lf
+web-cert-renew     text eol=lf
+nstp               text eol=lf
+
+# Markdown / generic text — also LF for cross-platform consistency
+*.md        text eol=lf
+LICENSE     text eol=lf
+.gitignore  text eol=lf
+.gitattributes text eol=lf

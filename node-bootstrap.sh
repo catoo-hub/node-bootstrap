@@ -36,6 +36,9 @@ readonly NSTP_BIN="/usr/local/bin/nstp"
 readonly SNI_ROTATE_BIN="/usr/local/bin/web-sni-rotate"
 readonly CERT_RENEW_BIN="/usr/local/bin/web-cert-renew"
 
+# Where to fetch supporting files from (raw GitHub) when running via curl
+readonly RAW_BASE="https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main"
+
 # Container names — neutral
 readonly NODE_CONTAINER="web-node"
 readonly NGINX_CONTAINER="web-nginx"
@@ -1155,6 +1158,76 @@ NSTP_SCRIPT
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
+# SECTION 12b · SNI ROTATOR INSTALLATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+install_sni_rotator() {
+    log_step "Installing SNI rotator engine"
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would install ${SNI_ROTATE_BIN} + cron /etc/cron.d/web-sni-rotate"
+        STEP_STATUS["sni_rotator"]="DRY"
+        return 0
+    fi
+
+    # Source: either alongside this script (cloned repo) or fetched from RAW_BASE
+    local src=""
+    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
+    if [[ -f "${script_dir}/web-sni-rotate" ]]; then
+        src="${script_dir}/web-sni-rotate"
+        log_info "Installing rotator from local copy: ${src}"
+        cp "$src" "$SNI_ROTATE_BIN"
+    else
+        log_info "Fetching rotator from ${RAW_BASE}/web-sni-rotate"
+        if ! curl -fsSL "${RAW_BASE}/web-sni-rotate" -o "$SNI_ROTATE_BIN"; then
+            log_error "Failed to download web-sni-rotate"
+            STEP_STATUS["sni_rotator"]="FAILED"
+            return 1
+        fi
+    fi
+    chmod +x "$SNI_ROTATE_BIN"
+
+    # Daily cron — rotator decides internally whether to act based on ROTATION_DAYS
+    # Random minute in 04:00-04:59 to spread load across multiple nodes
+    local rand_min=$((RANDOM % 60))
+    cat > /etc/cron.d/web-sni-rotate <<EOF
+# node-bootstrap: daily SNI rotation check (acts only when due per ROTATION_DAYS)
+${rand_min} 4 * * * root ${SNI_ROTATE_BIN} rotate >> /var/log/web-sni-rotate.log 2>&1
+EOF
+    chmod 644 /etc/cron.d/web-sni-rotate
+    log_ok "Installed ${SNI_ROTATE_BIN} + cron at 04:${rand_min} daily"
+    STEP_STATUS["sni_rotator"]="OK"
+}
+
+run_initial_sni_setup() {
+    log_step "Bootstrapping first SNI in panel"
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would run: web-sni-rotate init"
+        return 0
+    fi
+
+    # Need jq + node container up + panel reachable
+    if ! command -v jq &>/dev/null; then
+        log_warn "jq not installed — skipping initial SNI setup. Run 'nstp sni init' manually after installing jq."
+        STEP_STATUS["sni_init"]="SKIPPED"
+        return 0
+    fi
+
+    # Give node container ~10s to register with panel before we ask the panel about it
+    log_info "Waiting ~10s for node to register with panel..."
+    sleep 10
+
+    if "$SNI_ROTATE_BIN" init 2>&1 | sed 's/^/    [sni-init] /'; then
+        log_ok "Initial SNI bootstrapped and pushed to panel"
+        STEP_STATUS["sni_init"]="OK"
+    else
+        log_warn "Initial SNI setup failed (panel may not have registered node yet)."
+        log_warn "Run manually once the node shows as online in the panel:"
+        log_warn "    web-sni-rotate init"
+        STEP_STATUS["sni_init"]="DEFERRED"
+    fi
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
 # SECTION 13 · SUMMARY / UNINSTALL
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1171,9 +1244,15 @@ print_summary() {
     echo ""
     echo -e "  ${BOLD}Next steps:${RESET}"
     echo "    1. In Remnawave panel: confirm node '${NODE_NAME}' is online"
-    echo "    2. Run: ${BOLD}nstp sni rotate${RESET} to initialise SNI rotation (creates first AUTOSNI host)"
-    echo "    3. Subscribe a test user → verify connection works"
+    if [[ "${STEP_STATUS[sni_init]:-}" == "DEFERRED" ]]; then
+        echo "    2. Initial SNI was NOT pushed (node not yet visible in panel). Run:"
+        echo "         ${BOLD}web-sni-rotate init${RESET}"
+    else
+        echo "    2. First AUTOSNI host is live in panel — subscribe a test user"
+    fi
+    echo "    3. SNI rotation runs daily via cron (acts only every ${ROTATION_DAYS}d)"
     echo "    4. ${BOLD}nstp status${RESET} any time to check health"
+    echo "    5. ${BOLD}nstp sni list${RESET} to see active SNIs and next rotation time"
     echo ""
 }
 
@@ -1310,8 +1389,13 @@ main() {
     setup_nginx_selfsteal
     setup_node
     install_nstp_cli
+    install_sni_rotator
 
+    # Persist state BEFORE attempting initial SNI bootstrap — the rotator reads from it.
     state_save
+
+    run_initial_sni_setup
+
     print_summary
 }
 

@@ -523,7 +523,7 @@ collect_params() {
     if [[ -z "$DOMAIN" ]]; then
         [[ "$NON_INTERACTIVE" == true ]] && { log_error "--domain is required"; exit 1; }
         while true; do
-            read -rp "  Base domain (cert will cover *.node.<domain>): " DOMAIN
+            read -rp "  Base domain (cert will cover *.<domain>, e.g. node.example.com): " DOMAIN
             _validate_domain "$DOMAIN" && break
             log_warn "Invalid: ${DOMAIN}"
         done
@@ -816,8 +816,8 @@ install_docker() {
 # ─────────────────────────────────────────────────────────────────────────────
 
 setup_cert() {
-    log_step "Issuing wildcard cert for *.node.${DOMAIN}"
-    [[ "$DRY_RUN" == true ]] && { log_dry "acme.sh + CF DNS-01 for *.node.${DOMAIN}"; STEP_STATUS["cert"]="DRY"; return 0; }
+    log_step "Issuing wildcard cert for *.${DOMAIN}"
+    [[ "$DRY_RUN" == true ]] && { log_dry "acme.sh + CF DNS-01 for *.${DOMAIN}"; STEP_STATUS["cert"]="DRY"; return 0; }
 
     local acme_home="/root/.acme.sh"
     if [[ ! -x "${acme_home}/acme.sh" ]]; then
@@ -860,29 +860,38 @@ setup_cert() {
     else
         log_info "Requesting cert (DNS propagation can take ~2min)..."
         local acme_log; acme_log="$(mktemp)"
-        local rc=0
+        # Run with set +e so we can check the real exit code from acme.sh below.
+        # We pipe through tee for live progress + log capture; pipefail/sed combo
+        # would mask acme.sh's true exit code, so save it explicitly via PIPESTATUS.
+        set +e
         CF_Token="$CF_TOKEN" "${acme_home}/acme.sh" --issue \
             --dns dns_cf \
-            -d "node.${DOMAIN}" \
-            -d "*.node.${DOMAIN}" \
+            -d "${DOMAIN}" \
+            -d "*.${DOMAIN}" \
             --keylength ec-256 \
             --server letsencrypt \
-            --force 2>&1 | tee "$acme_log" | sed 's/^/    [acme] /' || rc=$?
-        # tee broke the pipefail propagation — re-check the log for known fail markers
-        if (( rc != 0 )) || grep -qE "Error|error issuing certificate|Pending|Could not get certificate" "$acme_log"; then
-            log_error "Cert issuance failed. Last 20 lines of acme.sh output:"
-            tail -20 "$acme_log" | sed 's/^/    [acme] /' >&2
+            --force 2>&1 | tee "$acme_log" | sed 's/^/    [acme] /'
+        local rc=${PIPESTATUS[0]}
+        set -e
+
+        # Success signal: acme.sh prints "Cert success." once the cert is downloaded.
+        # The intermediate "Pending. The CA is processing your order, please wait." line
+        # is NOT an error — it's a normal status during validation. Don't grep for it.
+        if (( rc != 0 )) || ! grep -q "Cert success\." "$acme_log"; then
+            log_error "Cert issuance failed (exit code: ${rc}). Last 25 lines of acme.sh output:"
+            tail -25 "$acme_log" | sed 's/^/    [acme] /' >&2
             log_error "Common causes:"
-            log_error "  • CF token missing 'Zone:DNS:Edit' for zone '${DOMAIN}'"
-            log_error "  • Wrong base domain (you gave '${DOMAIN}', wildcard is for *.node.${DOMAIN})"
-            log_error "  • Let's Encrypt rate limit hit (5 duplicate certs/week)"
+            log_error "  • CF token lacks 'Zone:DNS:Edit' for the zone covering '${DOMAIN}'"
+            log_error "  • DOMAIN is not a subdomain of any zone in your Cloudflare account"
+            log_error "  • Let's Encrypt rate limit hit (5 duplicate certs/week per registered domain)"
             rm -f "$acme_log"
             STEP_STATUS["cert"]="FAILED"
             return 1
         fi
         rm -f "$acme_log"
+        log_ok "Cert issued by Let's Encrypt"
         "${acme_home}/acme.sh" --install-cert \
-            -d "node.${DOMAIN}" --ecc \
+            -d "${DOMAIN}" --ecc \
             --fullchain-file "$fullchain" \
             --key-file "$privkey" \
             --reloadcmd "docker compose -f ${NGINX_DIR}/docker-compose.yml exec ${NGINX_CONTAINER} nginx -s reload 2>/dev/null || true" \
@@ -894,15 +903,15 @@ setup_cert() {
 
     # Compat symlink for Hysteria2 config (uses /etc/nginx/ssl/<domain>/ paths)
     mkdir -p "/etc/nginx/ssl"
-    ln -sfn "${NGINX_DIR}/ssl" "/etc/nginx/ssl/node.${DOMAIN}" 2>/dev/null || true
+    ln -sfn "${NGINX_DIR}/ssl" "/etc/nginx/ssl/${DOMAIN}" 2>/dev/null || true
 
     # Manual renew helper
     cat > "$CERT_RENEW_BIN" <<EOF
 #!/usr/bin/env bash
 set -e
 source ${STATE_DIR}/secrets.env
-CF_Token="\$CF_TOKEN" ${acme_home}/acme.sh --renew -d node.${DOMAIN} --ecc --force
-${acme_home}/acme.sh --install-cert -d node.${DOMAIN} --ecc \\
+CF_Token="\$CF_TOKEN" ${acme_home}/acme.sh --renew -d ${DOMAIN} --ecc --force
+${acme_home}/acme.sh --install-cert -d ${DOMAIN} --ecc \\
     --fullchain-file ${fullchain} \\
     --key-file ${privkey} \\
     --reloadcmd "docker compose -f ${NGINX_DIR}/docker-compose.yml exec ${NGINX_CONTAINER} nginx -s reload 2>/dev/null || true"
@@ -975,7 +984,7 @@ ssl_session_tickets off;
 server {
     listen unix:${NGINX_SOCK} ssl proxy_protocol;
     http2 on;
-    server_name *.node.${DOMAIN} node.${DOMAIN};
+    server_name *.${DOMAIN} ${DOMAIN};
 
     ssl_certificate     /etc/nginx/ssl/fullchain.pem;
     ssl_certificate_key /etc/nginx/ssl/privkey.pem;
@@ -1119,8 +1128,8 @@ build_xray_config() {
     local tag_grpc="${tag_main}-GRPC"
     local tag_xhttp="${tag_main}-XHTTP"
     local tag_hys="${tag_main}-HYS"
-    local hys_cert="/etc/nginx/ssl/node.${DOMAIN}/fullchain.pem"
-    local hys_key="/etc/nginx/ssl/node.${DOMAIN}/privkey.pem"
+    local hys_cert="/etc/nginx/ssl/${DOMAIN}/fullchain.pem"
+    local hys_key="/etc/nginx/ssl/${DOMAIN}/privkey.pem"
 
     jq -n \
         --arg t1 "$tag_main" --arg t2 "$tag_grpc" --arg t3 "$tag_xhttp" --arg t4 "$tag_hys" \
@@ -1242,13 +1251,13 @@ generate_initial_sni() {
         cdn)
             local prefixes=(api cdn docs static web edge assets media swagger supabase)
             local regions=(fra ams lhr sgp nrt iad lax ord)
-            echo "${prefixes[$RANDOM % ${#prefixes[@]}]}-$((RANDOM % 99 + 1))-${regions[$RANDOM % ${#regions[@]}]}.node.${DOMAIN}"
+            echo "${prefixes[$RANDOM % ${#prefixes[@]}]}-$((RANDOM % 99 + 1))-${regions[$RANDOM % ${#regions[@]}]}.${DOMAIN}"
             ;;
         words)
-            echo "blue-river-$((RANDOM % 99 + 1)).node.${DOMAIN}"
+            echo "blue-river-$((RANDOM % 99 + 1)).${DOMAIN}"
             ;;
         hex)
-            echo "$(openssl rand -hex 3).node.${DOMAIN}"
+            echo "$(openssl rand -hex 3).${DOMAIN}"
             ;;
     esac
 }
@@ -1407,8 +1416,8 @@ setup_initial_hosts() {
     # XHTTP host (any node.<DOMAIN> domain works as SNI since wildcard cert)
     body="$(jq -n \
         --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_XHTTP_UUID" \
-        --arg remark "$(_remark "" "XHTTP")" --arg addr "node.${DOMAIN}" \
-        --arg sni "node.${DOMAIN}" --arg tag "${tag_base}:XHTTP" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
+        --arg remark "$(_remark "" "XHTTP")" --arg addr "${DOMAIN}" \
+        --arg sni "${DOMAIN}" --arg tag "${tag_base}:XHTTP" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
         --arg path "$XHTTP_PATH" \
         '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:443,sni:$sni,path:$path,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
     resp="$(panel_create_host "$body")" || { log_error "Failed to create XHTTP host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
@@ -1417,8 +1426,8 @@ setup_initial_hosts() {
     # Hysteria host (UDP, with TLS — address by domain for SNI match against cert)
     body="$(jq -n \
         --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_HYS_UUID" \
-        --arg remark "$(_remark "" "HYS")" --arg addr "node.${DOMAIN}" \
-        --arg sni "node.${DOMAIN}" --arg tag "${tag_base}:HYS" --arg node "$NODE_UUID" \
+        --arg remark "$(_remark "" "HYS")" --arg addr "${DOMAIN}" \
+        --arg sni "${DOMAIN}" --arg tag "${tag_base}:HYS" --arg node "$NODE_UUID" \
         '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:9443,sni:$sni,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
     resp="$(panel_create_host "$body")" || { log_error "Failed to create Hysteria host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
     local h_hys; h_hys="$(echo "$resp" | jq -r '.response.uuid')"
@@ -1714,7 +1723,7 @@ ${BOLD}Usage:${RESET}
   bash ${SCRIPT_NAME} [OPTIONS]
 
 ${BOLD}Required:${RESET}
-  --domain <d>            base domain (cert covers *.node.<d>)
+  --domain <d>            base domain (cert covers *.<d>, e.g. node.example.com)
   --cf-token <t>          Cloudflare API token (Zone:DNS:Edit)
   --panel-url <u>         Remnawave panel URL
   --panel-token <t>       Panel API token

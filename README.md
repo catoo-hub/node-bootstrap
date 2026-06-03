@@ -14,7 +14,7 @@
 |---|---|
 | **Base hardening** | BBR sysctl, swap, SSH harden, UFW, fail2ban |
 | **Docker + Compose v2** | с fallback на `docker.io` если `get.docker.com` отдаёт 403 |
-| **acme.sh + Cloudflare DNS-01** | wildcard `*.node.example.com`, авто-renew |
+| **acme.sh + Cloudflare DNS-01** | wildcard `*.<DOMAIN>` (где `<DOMAIN>` — параметр, например `node.example.com` → `*.node.example.com`), авто-renew |
 | **Nginx selfsteal** | unix-socket `/dev/shm/nginx.sock` с proxy_protocol, wildcard cert; gRPC pass через `/dev/shm/xrxh.socket` для XHTTP; default-server `ssl_reject_handshake on` |
 | **rw-node** (`ghcr.io/remnawave/node:latest`) | нейтральное имя `web-node` в `/opt/web/node`, `network_mode: host` |
 | **4 inbounds** | Reality TCP `:443`, Reality gRPC `:8443`, VLESS-XHTTP через unix-socket, Hysteria2 `:9443/udp` — всё в одной config-profile в панели |
@@ -28,7 +28,7 @@ client → :443/IP TCP    (rw-node Xray Reality, raw)        → SNI matches
             ├─ Reality magic ok                  →  VLESS user traffic
             └─ обычный TLS handshake             →  unix:/dev/shm/nginx.sock
                                                        ↓
-                                                  Nginx (wildcard *.node.<domain>)
+                                                  Nginx (wildcard *.<DOMAIN>)
                                                        ↓
                                                   HTML stub
                                                        │

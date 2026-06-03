@@ -90,7 +90,7 @@ generate_sni() {
         *)
             log_err "Unknown SNI_STYLE: $style"; return 1 ;;
     esac
-    echo "${s}.node.${DOMAIN}"
+    echo "${s}.${DOMAIN}"
 }
 
 # ─── State helpers ──────────────────────────────────────────────────────────

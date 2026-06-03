@@ -1,0 +1,11 @@
+# Local install state / secrets that should never end up in git
+.env
+*.env.local
+*.bak
+*.backup
+*.swp
+*~
+
+# Test artifacts
+/tmp/
+/test/

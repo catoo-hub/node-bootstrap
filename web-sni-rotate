@@ -142,9 +142,24 @@ _build_remark() {
     echo "${s:0:40}"
 }
 
+_sockopt_params() {
+    cat <<'JSON'
+{
+  "tcpcongestion": "bbr",
+  "domainStrategy": "AsIs",
+  "tcpUserTimeout": 10000,
+  "tcpKeepAliveIdle": 300,
+  "tcpKeepAliveInterval": 60
+}
+JSON
+}
+
 # Args: $1=sni  →  echoes "reality_host_uuid|grpc_host_uuid"
+# Both hosts use securityLayer=DEFAULT — panel reads Reality settings from the
+# inbound (Reality + serverNames + pbk + sid + fp from realitySettings).
 create_hosts_for_sni() {
     local sni="$1"
+    local sockopt; sockopt="$(_sockopt_params)"
 
     local reality_body
     reality_body="$(jq -n \
@@ -156,7 +171,11 @@ create_hosts_for_sni() {
         --arg tag "${TAG_PREFIX}" \
         --arg fp "${DEFAULT_FP:-randomized}" \
         --arg node "$NODE_UUID" \
-        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:443,sni:$sni,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+        --argjson sockopt "$sockopt" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+          remark:$remark, address:$addr, port:443, sni:$sni,
+          fingerprint:$fp, tag:$tag, securityLayer:"DEFAULT",
+          sockoptParams:$sockopt, nodes:[$node]}')"
     local r1; r1="$(api_req POST /api/hosts "$reality_body")" || return 1
     local host_reality; host_reality="$(echo "$r1" | jq -r '.response.uuid')"
 
@@ -171,7 +190,11 @@ create_hosts_for_sni() {
         --arg fp "${DEFAULT_FP:-randomized}" \
         --arg node "$NODE_UUID" \
         --arg path "grpc-proxy" \
-        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:8443,sni:$sni,path:$path,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+        --argjson sockopt "$sockopt" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+          remark:$remark, address:$addr, port:8443, sni:$sni, path:$path,
+          fingerprint:$fp, tag:$tag, securityLayer:"DEFAULT",
+          sockoptParams:$sockopt, nodes:[$node]}')"
     local r2; r2="$(api_req POST /api/hosts "$grpc_body")" || return 1
     local host_grpc; host_grpc="$(echo "$r2" | jq -r '.response.uuid')"
 

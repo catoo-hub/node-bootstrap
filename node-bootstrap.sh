@@ -1490,6 +1490,39 @@ setup_panel_resources() {
 }
 
 # Create 4 hosts (Reality TCP, Reality gRPC, XHTTP, Hysteria) at first install
+# Returns Xray xHTTP extra-params JSON for the XHTTP host config.
+# Tuned per the user-provided reference (xmux + padding + body-size ranges).
+_xhttp_extra_json() {
+    cat <<'JSON'
+{
+  "xmux": {
+    "cMaxReuseTimes": "200-300",
+    "maxConnections": 1,
+    "hKeepAlivePeriod": 60,
+    "hMaxRequestTimes": "200-300",
+    "hMaxReusableSecs": "600-900"
+  },
+  "noGRPCHeader": false,
+  "xPaddingBytes": "100-500",
+  "scMaxEachPostBytes": "393216-786432"
+}
+JSON
+}
+
+# Returns sockopt params JSON for TCP-based hosts (Reality TCP, gRPC, XHTTP).
+# Skip for Hysteria — it's UDP, tcp* tunables don't apply.
+_sockopt_params_json() {
+    cat <<'JSON'
+{
+  "tcpcongestion": "bbr",
+  "domainStrategy": "AsIs",
+  "tcpUserTimeout": 10000,
+  "tcpKeepAliveIdle": 300,
+  "tcpKeepAliveInterval": 60
+}
+JSON
+}
+
 setup_initial_hosts() {
     log_step "Creating initial hosts in panel"
     [[ "$DRY_RUN" == true ]] && { log_dry "POST /api/hosts × 4"; STEP_STATUS["hosts"]="DRY"; return 0; }
@@ -1499,57 +1532,88 @@ setup_initial_hosts() {
     local cname; cname="$(country_name "$COUNTRY_CODE")"
     local tag_base="${TAG_PREFIX}"
 
+    # Pre-build JSON-fragment params so jq can include them as nested objects.
+    local xhttp_extra sockopt_params
+    xhttp_extra="$(_xhttp_extra_json)"
+    sockopt_params="$(_sockopt_params_json)"
+
     # Helper to truncate remark to 40 chars
     _remark() {
         local prefix="$1" suffix="$2"
         local s="[${NODE_NAME}] ${flag} ${cname} · ${suffix}"
-        # If too long, drop country name
-        if (( ${#s} > 40 )); then
-            s="[${NODE_NAME}] ${flag} · ${suffix}"
-        fi
-        # Final fallback
-        if (( ${#s} > 40 )); then
-            s="[${NODE_NAME}] · ${suffix}"
-        fi
+        if (( ${#s} > 40 )); then s="[${NODE_NAME}] ${flag} · ${suffix}"; fi
+        if (( ${#s} > 40 )); then s="[${NODE_NAME}] · ${suffix}"; fi
         echo "${s:0:40}"
     }
 
-    # Reality TCP host
+    # ─── Reality TCP — securityLayer=DEFAULT (panel reads Reality from inbound)
     local body
     body="$(jq -n \
         --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
         --arg remark "$(_remark "" "REALITY")" --arg addr "$NODE_PUBLIC_IP" \
         --arg sni "$sni" --arg tag "${tag_base}" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
-        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:443,sni:$sni,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+        --argjson sockopt "$sockopt_params" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+          remark:$remark, address:$addr, port:443, sni:$sni,
+          fingerprint:$fp, tag:$tag, securityLayer:"DEFAULT",
+          sockoptParams:$sockopt, nodes:[$node]}')"
     local resp; resp="$(panel_create_host "$body")" || { log_error "Failed to create Reality TCP host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
     local h_reality; h_reality="$(echo "$resp" | jq -r '.response.uuid')"
 
-    # Reality gRPC host
+    # ─── Reality gRPC — securityLayer=DEFAULT, serviceName via path
     body="$(jq -n \
         --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_GRPC_UUID" \
         --arg remark "$(_remark "" "GRPC")" --arg addr "$NODE_PUBLIC_IP" \
         --arg sni "$sni" --arg tag "${tag_base}:GRPC" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
         --arg path "grpc-proxy" \
-        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:8443,sni:$sni,path:$path,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+        --argjson sockopt "$sockopt_params" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+          remark:$remark, address:$addr, port:8443, sni:$sni, path:$path,
+          fingerprint:$fp, tag:$tag, securityLayer:"DEFAULT",
+          sockoptParams:$sockopt, nodes:[$node]}')"
     resp="$(panel_create_host "$body")" || { log_error "Failed to create Reality gRPC host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
     local h_grpc; h_grpc="$(echo "$resp" | jq -r '.response.uuid')"
 
-    # XHTTP host (any node.<DOMAIN> domain works as SNI since wildcard cert)
+    # ─── XHTTP — securityLayer=TLS (Xray inbound is socket-only; nginx terminates
+    # TLS in front, so the client MUST do TLS itself to reach nginx).
+    # SNI = base ${DOMAIN}: XHTTP/Hysteria are intentionally NOT rotated so that
+    # a Reality-SNI bust doesn't collateral-kill them. ALPN h3,h2,http/1.1 for
+    # client to advertise QUIC fallback chain.
     body="$(jq -n \
         --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_XHTTP_UUID" \
-        --arg remark "$(_remark "" "XHTTP")" --arg addr "${DOMAIN}" \
-        --arg sni "${DOMAIN}" --arg tag "${tag_base}:XHTTP" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
+        --arg remark "$(_remark "" "XHTTP")" --arg addr "$NODE_PUBLIC_IP" \
+        --arg sni "${DOMAIN}" --arg host "${DOMAIN}" \
+        --arg tag "${tag_base}:XHTTP" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
         --arg path "$XHTTP_PATH" \
-        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:443,sni:$sni,path:$path,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+        --argjson xhttp_extra "$xhttp_extra" \
+        --argjson sockopt "$sockopt_params" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+          remark:$remark, address:$addr, port:443,
+          sni:$sni, host:$host, path:$path,
+          alpn:"h3,h2,http/1.1",
+          fingerprint:$fp, tag:$tag,
+          securityLayer:"TLS",
+          xHttpExtraParams:$xhttp_extra,
+          sockoptParams:$sockopt,
+          nodes:[$node]}')"
     resp="$(panel_create_host "$body")" || { log_error "Failed to create XHTTP host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
     local h_xhttp; h_xhttp="$(echo "$resp" | jq -r '.response.uuid')"
 
-    # Hysteria host (UDP, with TLS — address by domain for SNI match against cert)
+    # ─── Hysteria — UDP/QUIC with its own TLS (cert from wildcard mount).
+    # ALPN h3 (QUIC). securityLayer=TLS explicit. fingerprint set for the
+    # underlying uTLS handshake. No sockoptParams — Hysteria is UDP.
     body="$(jq -n \
         --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_HYS_UUID" \
-        --arg remark "$(_remark "" "HYS")" --arg addr "${DOMAIN}" \
-        --arg sni "${DOMAIN}" --arg tag "${tag_base}:HYS" --arg node "$NODE_UUID" \
-        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:9443,sni:$sni,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+        --arg remark "$(_remark "" "HYS")" --arg addr "$NODE_PUBLIC_IP" \
+        --arg sni "${DOMAIN}" --arg host "${DOMAIN}" \
+        --arg tag "${tag_base}:HYS" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+          remark:$remark, address:$addr, port:9443,
+          sni:$sni, host:$host,
+          alpn:"h3",
+          fingerprint:$fp, tag:$tag,
+          securityLayer:"TLS",
+          nodes:[$node]}')"
     resp="$(panel_create_host "$body")" || { log_error "Failed to create Hysteria host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
     local h_hys; h_hys="$(echo "$resp" | jq -r '.response.uuid')"
 

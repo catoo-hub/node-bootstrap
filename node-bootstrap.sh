@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  node-bootstrap.sh — Remnawave node installer with rotating SNI
+#  node-bootstrap.sh — Remnawave node installer (full API-driven setup)
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
 #
+#  v1.1.0 — node creation + config-profile creation + hosts creation all via API
+#
 #  Usage (interactive):     bash node-bootstrap.sh
-#  Usage (non-interactive): bash node-bootstrap.sh --domain ... --cf-token ... -y
+#  Usage (non-interactive): bash node-bootstrap.sh --country NL --hosting 1CENT ... -y
 #
 #  Author:   catoo-hub
 #  License:  MIT
-#  Version:  1.0.0
 # ==============================================================================
 
 set -euo pipefail
@@ -18,7 +19,7 @@ IFS=$'\n\t'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
 readonly LOG_FILE="/var/log/node-bootstrap.log"
 readonly STATE_DIR="/opt/web/state"
@@ -31,19 +32,19 @@ readonly WEB_DIR="/opt/web"
 readonly NODE_DIR="${WEB_DIR}/node"
 readonly NGINX_DIR="${WEB_DIR}/nginx"
 readonly NGINX_SOCK="/dev/shm/nginx.sock"
+readonly XHTTP_SOCK="/dev/shm/xrxh.socket"
 
 readonly NSTP_BIN="/usr/local/bin/nstp"
 readonly SNI_ROTATE_BIN="/usr/local/bin/web-sni-rotate"
 readonly CERT_RENEW_BIN="/usr/local/bin/web-cert-renew"
 
-# Where to fetch supporting files from (raw GitHub) when running via curl
 readonly RAW_BASE="https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main"
 
 # Container names — neutral
 readonly NODE_CONTAINER="web-node"
 readonly NGINX_CONTAINER="web-nginx"
 
-# Image names — upstream-dictated (can't rename)
+# Image names — upstream-dictated
 readonly NODE_IMAGE="ghcr.io/remnawave/node:latest"
 readonly NGINX_IMAGE="nginx:1.27-alpine"
 
@@ -57,22 +58,51 @@ WITH_MONITORING=false
 
 # Required params
 DOMAIN=""                  # example.com — wildcard base
-NODE_NAME=""               # AUTOSNI:NODE_NAME tag value, default = hostname
 CF_TOKEN=""                # Cloudflare API Token
 PANEL_URL=""               # https://panel.example.com
 PANEL_API_TOKEN=""         # API token from panel
-NODE_SECRET_KEY=""         # SECRET_KEY from panel's "Create node" flow
-NODE_PORT="2222"           # rw-node bind port (panel ↔ node)
+COUNTRY_CODE=""            # ISO-2: NL, FI, DE, ...
+HOSTING=""                 # optional suffix: 1CENT, HETZNER, ...
+
+# Naming (auto-derived if blank)
+NODE_NAME=""               # NL-02 or NL-02-1CENT
+NODE_SEQUENCE=""           # 02 — auto-detected from existing nodes
+TAG_PREFIX=""              # AUTOSNI:NL02
+
+# Existing-resource overrides (for re-runs / hybrid setups)
+USE_EXISTING_NODE=false
+EXISTING_NODE_UUID=""
+NODE_SECRET_KEY=""         # if --existing-node + --node-key: skip POST /api/nodes
+CONFIG_PROFILE_UUID=""
+NODE_INBOUND_REALITY_UUID=""
+NODE_INBOUND_GRPC_UUID=""
+NODE_INBOUND_XHTTP_UUID=""
+NODE_INBOUND_HYS_UUID=""
+
+# Rotation
 ROTATION_DAYS=3
 ACTIVE_SNIS=3
 SNI_STYLE="cdn"            # cdn | words | hex
-DEFAULT_FP="randomized"    # randomized | chrome | firefox | ...
+DEFAULT_FP="randomized"    # randomized | chrome | firefox | safari | ios | android | edge | qq
 
-# Optional
-NODE_INBOUND_UUID=""       # config-profile inbound to manage (panel API will look up if blank)
-CONFIG_PROFILE_UUID=""
+# Node container
+NODE_PORT="2222"           # rw-node ↔ panel control port
 
-# Auto-detected
+# Reality keys — generated per inbound (TCP + gRPC use SEPARATE keypairs)
+REALITY_PRIV_TCP=""
+REALITY_PUB_TCP=""
+REALITY_PRIV_GRPC=""
+REALITY_PUB_GRPC=""
+
+# Hysteria2
+HYS_OBFS_PASSWORD=""
+HYS_PASSWORD=""
+
+# XHTTP path — chosen at install time from XHTTP_PATH_POOL
+XHTTP_PATH=""
+
+# Misc
+NODE_UUID=""               # filled after POST /api/nodes
 NODE_PUBLIC_IP=""
 HOSTNAME_SHORT=""
 OS_ID=""
@@ -80,15 +110,109 @@ OS_VERSION_ID=""
 ARCH=""
 IS_CONTAINER=false
 VIRT_TYPE=""
-PKG_MGR="apt-get"
 
-# Step status tracking
 declare -A STEP_STATUS=()
 
 # Auto-detect pipe mode
 if [[ ! -t 0 ]]; then
     NON_INTERACTIVE=true
 fi
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 1b · COUNTRY CODE TABLE (ISO 3166-1 alpha-2 → English name)
+#   Used to build remark strings; emoji flag generated mathematically from code.
+# ─────────────────────────────────────────────────────────────────────────────
+
+declare -A COUNTRY_NAME=(
+    [AD]="Andorra"           [AE]="UAE"              [AF]="Afghanistan"      [AG]="Antigua"
+    [AL]="Albania"           [AM]="Armenia"          [AO]="Angola"           [AR]="Argentina"
+    [AT]="Austria"           [AU]="Australia"        [AZ]="Azerbaijan"
+    [BA]="Bosnia"            [BB]="Barbados"         [BD]="Bangladesh"       [BE]="Belgium"
+    [BF]="Burkina Faso"      [BG]="Bulgaria"         [BH]="Bahrain"          [BI]="Burundi"
+    [BJ]="Benin"             [BN]="Brunei"           [BO]="Bolivia"          [BR]="Brazil"
+    [BS]="Bahamas"           [BT]="Bhutan"           [BW]="Botswana"         [BY]="Belarus"
+    [BZ]="Belize"
+    [CA]="Canada"            [CD]="DR Congo"         [CF]="CAR"              [CG]="Congo"
+    [CH]="Switzerland"       [CI]="Côte d'Ivoire"    [CL]="Chile"            [CM]="Cameroon"
+    [CN]="China"             [CO]="Colombia"         [CR]="Costa Rica"       [CU]="Cuba"
+    [CV]="Cape Verde"        [CY]="Cyprus"           [CZ]="Czechia"
+    [DE]="Germany"           [DJ]="Djibouti"         [DK]="Denmark"          [DM]="Dominica"
+    [DO]="Dominican Rep"     [DZ]="Algeria"
+    [EC]="Ecuador"           [EE]="Estonia"          [EG]="Egypt"            [ER]="Eritrea"
+    [ES]="Spain"             [ET]="Ethiopia"
+    [FI]="Finland"           [FJ]="Fiji"             [FM]="Micronesia"       [FR]="France"
+    [GA]="Gabon"             [GB]="United Kingdom"   [GD]="Grenada"          [GE]="Georgia"
+    [GH]="Ghana"             [GM]="Gambia"           [GN]="Guinea"           [GQ]="Eq. Guinea"
+    [GR]="Greece"            [GT]="Guatemala"        [GW]="Guinea-Bissau"    [GY]="Guyana"
+    [HK]="Hong Kong"         [HN]="Honduras"         [HR]="Croatia"          [HT]="Haiti"
+    [HU]="Hungary"
+    [ID]="Indonesia"         [IE]="Ireland"          [IL]="Israel"           [IN]="India"
+    [IQ]="Iraq"              [IR]="Iran"             [IS]="Iceland"          [IT]="Italy"
+    [JM]="Jamaica"           [JO]="Jordan"           [JP]="Japan"
+    [KE]="Kenya"             [KG]="Kyrgyzstan"       [KH]="Cambodia"         [KI]="Kiribati"
+    [KM]="Comoros"           [KN]="Saint Kitts"      [KP]="North Korea"      [KR]="South Korea"
+    [KW]="Kuwait"            [KZ]="Kazakhstan"
+    [LA]="Laos"              [LB]="Lebanon"          [LC]="Saint Lucia"      [LI]="Liechtenstein"
+    [LK]="Sri Lanka"         [LR]="Liberia"          [LS]="Lesotho"          [LT]="Lithuania"
+    [LU]="Luxembourg"        [LV]="Latvia"           [LY]="Libya"
+    [MA]="Morocco"           [MC]="Monaco"           [MD]="Moldova"          [ME]="Montenegro"
+    [MG]="Madagascar"        [MH]="Marshall Is."     [MK]="N. Macedonia"     [ML]="Mali"
+    [MM]="Myanmar"           [MN]="Mongolia"         [MR]="Mauritania"       [MT]="Malta"
+    [MU]="Mauritius"         [MV]="Maldives"         [MW]="Malawi"           [MX]="Mexico"
+    [MY]="Malaysia"          [MZ]="Mozambique"
+    [NA]="Namibia"           [NE]="Niger"            [NG]="Nigeria"          [NI]="Nicaragua"
+    [NL]="Netherlands"       [NO]="Norway"           [NP]="Nepal"            [NR]="Nauru"
+    [NZ]="New Zealand"
+    [OM]="Oman"
+    [PA]="Panama"            [PE]="Peru"             [PG]="PNG"              [PH]="Philippines"
+    [PK]="Pakistan"          [PL]="Poland"           [PT]="Portugal"         [PW]="Palau"
+    [PY]="Paraguay"
+    [QA]="Qatar"
+    [RO]="Romania"           [RS]="Serbia"           [RU]="Russia"           [RW]="Rwanda"
+    [SA]="Saudi Arabia"      [SB]="Solomon Is."      [SC]="Seychelles"       [SD]="Sudan"
+    [SE]="Sweden"            [SG]="Singapore"        [SI]="Slovenia"         [SK]="Slovakia"
+    [SL]="Sierra Leone"      [SM]="San Marino"       [SN]="Senegal"          [SO]="Somalia"
+    [SR]="Suriname"          [SS]="South Sudan"      [SV]="El Salvador"      [SY]="Syria"
+    [SZ]="Eswatini"
+    [TD]="Chad"              [TG]="Togo"             [TH]="Thailand"         [TJ]="Tajikistan"
+    [TL]="Timor-Leste"       [TM]="Turkmenistan"     [TN]="Tunisia"          [TO]="Tonga"
+    [TR]="Türkiye"           [TT]="Trinidad"         [TV]="Tuvalu"           [TW]="Taiwan"
+    [TZ]="Tanzania"
+    [UA]="Ukraine"           [UG]="Uganda"           [US]="United States"    [UY]="Uruguay"
+    [UZ]="Uzbekistan"
+    [VA]="Vatican"           [VC]="Saint Vincent"    [VE]="Venezuela"        [VN]="Vietnam"
+    [VU]="Vanuatu"
+    [WS]="Samoa"
+    [YE]="Yemen"
+    [ZA]="South Africa"      [ZM]="Zambia"           [ZW]="Zimbabwe"
+)
+
+# Plausible XHTTP paths (look like real API/metrics endpoints)
+XHTTP_PATH_POOL=(
+    "/api/v3/stats/"
+    "/api/v1/metrics/"
+    "/api/v2/events/"
+    "/internal/health/"
+    "/api/v1/telemetry/"
+    "/grpc.health.v1.Health/Check/"
+    "/api/v4/observability/"
+    "/api/v1/spans/"
+)
+
+# Generate emoji flag from ISO-2 country code (e.g. NL → 🇳🇱)
+country_flag() {
+    local cc="${1^^}"
+    [[ ${#cc} -ne 2 ]] && { echo ""; return; }
+    local A B
+    A=$(printf '\\U%08x' $((0x1F1E6 + $(printf '%d' "'${cc:0:1}") - 65)))
+    B=$(printf '\\U%08x' $((0x1F1E6 + $(printf '%d' "'${cc:1:1}") - 65)))
+    printf "$A$B"
+}
+
+country_name() {
+    local cc="${1^^}"
+    echo "${COUNTRY_NAME[$cc]:-${cc}}"
+}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 2 · COLOURS & LOGGING
@@ -128,54 +252,44 @@ log_debug() { [[ "$VERBOSE" == true ]] && echo -e "  ${GRAY}[DBG ]${RESET}  $*";
 log_dry()   { echo -e "  ${MAGENTA}[DRY ]${RESET}  $*"; _log_raw "[DRY ]  $*"; }
 log_step()  { echo ""; echo -e "${BOLD}══ $*${RESET}"; _log_raw "═══ $*"; }
 
-print_separator() { echo -e "  ${GRAY}─────────────────────────────────────────────${RESET}"; }
 print_header() {
     cat <<EOF
 
   ${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}
   ${BOLD}║          NODE BOOTSTRAP  ·  ${SCRIPT_VERSION}                           ║${RESET}
   ${BOLD}║          Remnawave node + rotating SNI + selfsteal      ║${RESET}
+  ${BOLD}║          Full API-driven setup                          ║${RESET}
   ${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}
 EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 3 · TRAP / FATAL HANDLER
+# SECTION 3 · TRAP
 # ─────────────────────────────────────────────────────────────────────────────
 
 _fatal_exit() {
     local rc=$?
-    if [[ $rc -ne 0 ]]; then
-        log_error "Abnormal exit (code ${rc}). Review ${LOG_FILE}"
-    fi
+    [[ $rc -ne 0 ]] && log_error "Abnormal exit (code ${rc}). Review ${LOG_FILE}"
     exit $rc
 }
 trap _fatal_exit EXIT
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 4 · PREFLIGHT CHECKS
+# SECTION 4 · PREFLIGHT
 # ─────────────────────────────────────────────────────────────────────────────
 
 _detect_os() {
-    if [[ -f /etc/os-release ]]; then
-        # shellcheck disable=SC1091
-        source /etc/os-release
-        OS_ID="${ID:-unknown}"
-        OS_VERSION_ID="${VERSION_ID:-unknown}"
-        log_info "Detected OS : ${PRETTY_NAME:-${OS_ID} ${OS_VERSION_ID}}"
-    else
-        log_error "/etc/os-release missing — cannot detect OS"
-        exit 1
-    fi
+    [[ -f /etc/os-release ]] || { log_error "/etc/os-release missing"; exit 1; }
+    # shellcheck disable=SC1091
+    source /etc/os-release
+    OS_ID="${ID:-unknown}"
+    OS_VERSION_ID="${VERSION_ID:-unknown}"
+    log_info "Detected OS : ${PRETTY_NAME:-${OS_ID} ${OS_VERSION_ID}}"
 }
 
 _detect_arch() {
     ARCH="$(uname -m)"
     log_info "Architecture: ${ARCH}"
-    case "$ARCH" in
-        x86_64|aarch64) ;;
-        *) log_warn "Untested architecture: ${ARCH} — proceeding anyway" ;;
-    esac
 }
 
 _detect_virt() {
@@ -183,7 +297,7 @@ _detect_virt() {
         VIRT_TYPE="$(systemd-detect-virt 2>/dev/null || echo 'none')"
         if [[ "$VIRT_TYPE" =~ ^(openvz|lxc|lxc-libvirt|docker|podman)$ ]]; then
             IS_CONTAINER=true
-            log_warn "Container virtualization detected: ${VIRT_TYPE} — Docker may have issues"
+            log_warn "Container virtualization: ${VIRT_TYPE} — Docker may have issues"
         else
             log_info "Virtualization: ${VIRT_TYPE}"
         fi
@@ -191,7 +305,7 @@ _detect_virt() {
 }
 
 _check_internet() {
-    log_debug "Checking internet connectivity..."
+    log_debug "Checking internet..."
     if ! curl -fsS --max-time 10 https://1.1.1.1/cdn-cgi/trace -o /dev/null 2>/dev/null \
        && ! curl -fsS --max-time 10 https://8.8.8.8 -o /dev/null 2>/dev/null; then
         log_error "No internet connectivity"
@@ -202,20 +316,14 @@ _check_internet() {
 
 _detect_public_ip() {
     NODE_PUBLIC_IP="$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' | head -1)"
-    if [[ -z "$NODE_PUBLIC_IP" ]]; then
-        NODE_PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '')"
-    fi
+    [[ -z "$NODE_PUBLIC_IP" ]] && NODE_PUBLIC_IP="$(curl -fsS --max-time 5 https://api.ipify.org 2>/dev/null || echo '')"
     HOSTNAME_SHORT="$(hostname -s)"
 }
 
 preflight_checks() {
     log_step "Preflight checks"
-    if [[ $EUID -ne 0 ]]; then
-        log_error "Must run as root (use sudo)"
-        exit 1
-    fi
+    [[ $EUID -ne 0 ]] && { log_error "Must run as root"; exit 1; }
     log_debug "Running as root — OK"
-
     _detect_os
     _detect_arch
     _detect_virt
@@ -225,25 +333,20 @@ preflight_checks() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 5 · SMALL UTILITIES
+# SECTION 5 · UTILITIES
 # ─────────────────────────────────────────────────────────────────────────────
 
 backup_file() {
     local f="$1"
     [[ -f "$f" ]] || return 0
     mkdir -p "$BACKUP_DIR"
-    local b="${BACKUP_DIR}/$(basename "$f").${TIMESTAMP}.bak"
-    cp -a "$f" "$b"
-    log_debug "Backed up: $f → $b"
+    cp -a "$f" "${BACKUP_DIR}/$(basename "$f").${TIMESTAMP}.bak"
 }
 
 apt_update() {
-    [[ "$SKIP_UPDATE" == true ]] && { log_info "Skipping apt update (--skip-update)"; return 0; }
+    [[ "$SKIP_UPDATE" == true ]] && { log_info "Skipping apt update"; return 0; }
     log_step "Updating package lists"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would run: apt-get update"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log_dry "apt-get update"; return 0; }
     DEBIAN_FRONTEND=noninteractive apt-get update -qq
     log_ok "Packages updated"
 }
@@ -251,18 +354,12 @@ apt_update() {
 install_packages() {
     local pkgs=("$@")
     [[ ${#pkgs[@]} -eq 0 ]] && return 0
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install: ${pkgs[*]}"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log_dry "Install: ${pkgs[*]}"; return 0; }
     local missing=()
     for p in "${pkgs[@]}"; do
         dpkg -s "$p" &>/dev/null || missing+=("$p")
     done
-    if [[ ${#missing[@]} -eq 0 ]]; then
-        log_debug "All requested packages already installed: ${pkgs[*]}"
-        return 0
-    fi
+    [[ ${#missing[@]} -eq 0 ]] && { log_debug "All present: ${pkgs[*]}"; return 0; }
     log_info "Installing: ${missing[*]}"
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${missing[@]}" \
         -o Dpkg::Options::="--force-confdef" \
@@ -273,13 +370,29 @@ install_packages() {
 _validate_domain() {
     [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)+$ ]]
 }
+_validate_url()    { [[ "$1" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$ ]]; }
+_validate_port()   { [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 )); }
+_validate_cc()     { [[ "$1" =~ ^[A-Z]{2}$ ]]; }
 
-_validate_url() {
-    [[ "$1" =~ ^https?://[A-Za-z0-9.-]+(:[0-9]+)?(/.*)?$ ]]
-}
+# Random string generators
+gen_password() { openssl rand -hex 12; }
+gen_short_id() { openssl rand -hex 8; }
 
-_validate_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+# Generate Reality x25519 keypair via the node image (most reliable, same lib as runtime)
+reality_keygen() {
+    local out
+    out="$(docker run --rm --entrypoint xray "$NODE_IMAGE" x25519 2>/dev/null)" || {
+        log_error "Failed to generate Reality keys (xray x25519)"
+        return 1
+    }
+    # Output format:
+    #   Private key: xxxxx
+    #   Public key:  yyyyy
+    local priv pub
+    priv="$(echo "$out" | grep -i 'private' | awk '{print $NF}')"
+    pub="$(echo "$out" | grep -i 'public'  | awk '{print $NF}')"
+    [[ -z "$priv" || -z "$pub" ]] && { log_error "Could not parse xray x25519 output"; return 1; }
+    echo "${priv}|${pub}"
 }
 
 state_save() {
@@ -288,6 +401,10 @@ state_save() {
 # node-bootstrap install config — generated $(date -Iseconds)
 DOMAIN="${DOMAIN}"
 NODE_NAME="${NODE_NAME}"
+NODE_SEQUENCE="${NODE_SEQUENCE}"
+COUNTRY_CODE="${COUNTRY_CODE}"
+HOSTING="${HOSTING}"
+TAG_PREFIX="${TAG_PREFIX}"
 NODE_PUBLIC_IP="${NODE_PUBLIC_IP}"
 NODE_PORT="${NODE_PORT}"
 PANEL_URL="${PANEL_URL}"
@@ -295,12 +412,25 @@ ROTATION_DAYS="${ROTATION_DAYS}"
 ACTIVE_SNIS="${ACTIVE_SNIS}"
 SNI_STYLE="${SNI_STYLE}"
 DEFAULT_FP="${DEFAULT_FP}"
+XHTTP_PATH="${XHTTP_PATH}"
+
+NODE_UUID="${NODE_UUID}"
 CONFIG_PROFILE_UUID="${CONFIG_PROFILE_UUID}"
-NODE_INBOUND_UUID="${NODE_INBOUND_UUID}"
+NODE_INBOUND_REALITY_UUID="${NODE_INBOUND_REALITY_UUID}"
+NODE_INBOUND_GRPC_UUID="${NODE_INBOUND_GRPC_UUID}"
+NODE_INBOUND_XHTTP_UUID="${NODE_INBOUND_XHTTP_UUID}"
+NODE_INBOUND_HYS_UUID="${NODE_INBOUND_HYS_UUID}"
+
+REALITY_PRIV_TCP="${REALITY_PRIV_TCP}"
+REALITY_PUB_TCP="${REALITY_PUB_TCP}"
+REALITY_PRIV_GRPC="${REALITY_PRIV_GRPC}"
+REALITY_PUB_GRPC="${REALITY_PUB_GRPC}"
+
+HYS_PASSWORD="${HYS_PASSWORD}"
+HYS_OBFS_PASSWORD="${HYS_OBFS_PASSWORD}"
 EOF
     chmod 600 "$CONFIG_FILE"
 
-    # Secrets stored separately, 600
     cat > "${STATE_DIR}/secrets.env" <<EOF
 CF_TOKEN="${CF_TOKEN}"
 PANEL_API_TOKEN="${PANEL_API_TOKEN}"
@@ -311,139 +441,207 @@ EOF
     echo "$SCRIPT_VERSION" > "$VERSION_FILE"
 }
 
-state_load() {
-    [[ -f "$CONFIG_FILE" ]] || return 1
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
-    if [[ -f "${STATE_DIR}/secrets.env" ]]; then
-        # shellcheck disable=SC1091
-        source "${STATE_DIR}/secrets.env"
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 5b · PANEL API CLIENT
+# ─────────────────────────────────────────────────────────────────────────────
+
+# panel_req <METHOD> <PATH> [BODY_JSON] — echoes response body only, sets RC
+panel_req() {
+    local method="$1" path="$2" body="${3:-}"
+    local url="${PANEL_URL}${path}"
+    local code
+    local resp
+    if [[ -n "$body" ]]; then
+        resp="$(curl -sS -X "$method" "$url" \
+            -H "Authorization: Bearer ${PANEL_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$body" \
+            -w '\n___HTTP_CODE___%{http_code}' 2>>"$LOG_FILE")"
+    else
+        resp="$(curl -sS -X "$method" "$url" \
+            -H "Authorization: Bearer ${PANEL_API_TOKEN}" \
+            -w '\n___HTTP_CODE___%{http_code}' 2>>"$LOG_FILE")"
     fi
+    code="${resp##*___HTTP_CODE___}"
+    local body_out="${resp%___HTTP_CODE___*}"
+    body_out="${body_out%$'\n'}"   # strip trailing newline
+    if [[ ! "$code" =~ ^2 ]]; then
+        log_error "Panel API ${method} ${path} returned ${code}"
+        log_debug "Response: ${body_out}"
+        echo "$body_out"
+        return 1
+    fi
+    echo "$body_out"
     return 0
 }
 
+panel_get_keygen() {
+    local r; r="$(panel_req GET /api/keygen)" || return 1
+    echo "$r" | jq -r '.response.pubKey'
+}
+
+panel_list_nodes() {
+    panel_req GET /api/nodes
+}
+
+# Detect next sequence number for a country: scans existing nodes' names matching <CC>-NN
+panel_detect_next_sequence() {
+    local cc="${1^^}"
+    local nodes; nodes="$(panel_list_nodes)" || { echo "01"; return; }
+    local highest
+    highest="$(echo "$nodes" | jq -r --arg cc "$cc" \
+        '[.response[] | .name | capture("^" + $cc + "-(?<n>[0-9]+)") | .n | tonumber] | max // 0')"
+    printf '%02d' $((highest + 1))
+}
+
+panel_create_config_profile() {
+    local profile_name="$1" config_json="$2"
+    local body
+    body="$(jq -n --arg n "$profile_name" --argjson c "$config_json" '{name: $n, config: $c}')"
+    local r; r="$(panel_req POST /api/config-profiles "$body")" || return 1
+    echo "$r"
+}
+
+panel_create_node() {
+    local body="$1"
+    local r; r="$(panel_req POST /api/nodes "$body")" || return 1
+    echo "$r"
+}
+
+panel_create_host() {
+    panel_req POST /api/hosts "$1"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 6 · PARAM COLLECTION (interactive prompts + flag validation)
+# SECTION 6 · PARAM COLLECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 collect_params() {
     log_step "Collecting installation parameters"
 
-    # Default node name = hostname (sanitized for tag regex ^[A-Z0-9_:]+$)
-    if [[ -z "$NODE_NAME" ]]; then
-        NODE_NAME="$(echo "$HOSTNAME_SHORT" | tr '[:lower:]' '[:upper:]' | tr -c 'A-Z0-9_:' '_')"
-        NODE_NAME="${NODE_NAME:-NODE01}"
-    fi
-
-    # DOMAIN
+    # 1. DOMAIN
     if [[ -z "$DOMAIN" ]]; then
-        if [[ "$NON_INTERACTIVE" == true ]]; then
-            log_error "--domain is required (e.g. example.com)"
-            exit 1
-        fi
+        [[ "$NON_INTERACTIVE" == true ]] && { log_error "--domain is required"; exit 1; }
         while true; do
-            read -rp "  Base domain for wildcard cert (e.g. example.com → *.node.example.com): " DOMAIN
+            read -rp "  Base domain (cert will cover *.node.<domain>): " DOMAIN
             _validate_domain "$DOMAIN" && break
-            log_warn "Invalid domain: '${DOMAIN}'"
+            log_warn "Invalid: ${DOMAIN}"
         done
     fi
-    _validate_domain "$DOMAIN" || { log_error "Invalid --domain: ${DOMAIN}"; exit 1; }
+    _validate_domain "$DOMAIN" || { log_error "Invalid --domain"; exit 1; }
 
-    # CF_TOKEN
+    # 2. CF_TOKEN
     if [[ -z "$CF_TOKEN" ]]; then
-        if [[ "$NON_INTERACTIVE" == true ]]; then
-            log_error "--cf-token is required"
-            exit 1
-        fi
-        echo -e "  ${GRAY}Generate at Cloudflare → My Profile → API Tokens (scope: Zone:DNS:Edit for ${DOMAIN})${RESET}"
+        [[ "$NON_INTERACTIVE" == true ]] && { log_error "--cf-token is required"; exit 1; }
+        echo -e "  ${GRAY}Cloudflare → My Profile → API Tokens → Custom (Zone:DNS:Edit for ${DOMAIN})${RESET}"
         while true; do
-            read -rsp "  Cloudflare API Token (input hidden): " CF_TOKEN
-            echo ""
-            [[ -n "$CF_TOKEN" && ${#CF_TOKEN} -ge 30 ]] && break
-            log_warn "Token looks too short — re-enter"
+            read -rsp "  Cloudflare API Token: "; CF_TOKEN="$REPLY"; echo ""
+            [[ ${#CF_TOKEN} -ge 30 ]] && break
+            log_warn "Looks short — re-enter"
         done
     fi
 
-    # PANEL_URL
+    # 3. PANEL_URL + token
     if [[ -z "$PANEL_URL" ]]; then
-        if [[ "$NON_INTERACTIVE" == true ]]; then
-            log_error "--panel-url is required"
-            exit 1
-        fi
+        [[ "$NON_INTERACTIVE" == true ]] && { log_error "--panel-url is required"; exit 1; }
         while true; do
             read -rp "  Panel URL (https://panel.example.com): " PANEL_URL
             _validate_url "$PANEL_URL" && break
-            log_warn "Invalid URL: '${PANEL_URL}'"
+            log_warn "Invalid: ${PANEL_URL}"
         done
     fi
     PANEL_URL="${PANEL_URL%/}"
-    _validate_url "$PANEL_URL" || { log_error "Invalid --panel-url"; exit 1; }
 
-    # PANEL_API_TOKEN
     if [[ -z "$PANEL_API_TOKEN" ]]; then
-        if [[ "$NON_INTERACTIVE" == true ]]; then
-            log_error "--panel-token is required"
-            exit 1
-        fi
-        echo -e "  ${GRAY}Generate in panel: Settings → API Tokens${RESET}"
+        [[ "$NON_INTERACTIVE" == true ]] && { log_error "--panel-token is required"; exit 1; }
         while true; do
-            read -rsp "  Panel API token (input hidden): " PANEL_API_TOKEN
-            echo ""
-            [[ -n "$PANEL_API_TOKEN" && ${#PANEL_API_TOKEN} -ge 16 ]] && break
-            log_warn "Token looks too short — re-enter"
+            read -rsp "  Panel API token: "; PANEL_API_TOKEN="$REPLY"; echo ""
+            [[ ${#PANEL_API_TOKEN} -ge 16 ]] && break
+            log_warn "Looks short — re-enter"
         done
     fi
 
-    # NODE_SECRET_KEY
-    if [[ -z "$NODE_SECRET_KEY" ]]; then
-        if [[ "$NON_INTERACTIVE" == true ]]; then
-            log_error "--node-key is required (SECRET_KEY from panel's Create Node flow)"
-            exit 1
+    # 4. COUNTRY_CODE
+    if [[ "$USE_EXISTING_NODE" == false ]]; then
+        if [[ -z "$COUNTRY_CODE" ]]; then
+            [[ "$NON_INTERACTIVE" == true ]] && { log_error "--country is required (ISO-2: NL, FI, DE)"; exit 1; }
+            while true; do
+                read -rp "  Country (ISO-2, e.g. NL, FI, DE, US): " COUNTRY_CODE
+                COUNTRY_CODE="${COUNTRY_CODE^^}"
+                _validate_cc "$COUNTRY_CODE" && break
+                log_warn "Two letters required"
+            done
         fi
-        echo -e "  ${GRAY}In panel: Nodes → Create new node → copy SECRET_KEY${RESET}"
-        while true; do
-            read -rsp "  Node SECRET_KEY (input hidden): " NODE_SECRET_KEY
-            echo ""
-            [[ -n "$NODE_SECRET_KEY" && ${#NODE_SECRET_KEY} -ge 20 ]] && break
-            log_warn "Key looks too short — re-enter"
-        done
+        COUNTRY_CODE="${COUNTRY_CODE^^}"
+        _validate_cc "$COUNTRY_CODE" || { log_error "--country must be ISO-2 (2 letters)"; exit 1; }
+
+        # 5. HOSTING (optional suffix)
+        if [[ -z "$HOSTING" && "$NON_INTERACTIVE" == false ]]; then
+            read -rp "  Hosting suffix (optional, e.g. 1CENT, HETZNER): " HOSTING
+        fi
+        HOSTING="${HOSTING^^}"
+        HOSTING="$(echo "$HOSTING" | tr -c 'A-Z0-9' '_' | sed 's/_*$//')"
+
+        # 6. NODE_SEQUENCE — auto-detect from panel
+        if [[ -z "$NODE_SEQUENCE" ]]; then
+            log_info "Auto-detecting next sequence number for ${COUNTRY_CODE}..."
+            NODE_SEQUENCE="$(panel_detect_next_sequence "$COUNTRY_CODE")"
+            log_info "Next sequence: ${NODE_SEQUENCE}"
+        fi
+
+        # 7. NODE_NAME
+        if [[ -z "$NODE_NAME" ]]; then
+            NODE_NAME="${COUNTRY_CODE}-${NODE_SEQUENCE}"
+            [[ -n "$HOSTING" ]] && NODE_NAME="${NODE_NAME}-${HOSTING}"
+        fi
+
+        # 8. TAG_PREFIX
+        TAG_PREFIX="AUTOSNI:${COUNTRY_CODE}${NODE_SEQUENCE}"
+    else
+        # Existing node: ensure we have UUID + KEY
+        if [[ -z "$EXISTING_NODE_UUID" ]]; then
+            [[ "$NON_INTERACTIVE" == true ]] && { log_error "--existing-node-uuid is required when --existing-node is set"; exit 1; }
+            read -rp "  Existing node UUID: " EXISTING_NODE_UUID
+        fi
+        NODE_UUID="$EXISTING_NODE_UUID"
+
+        if [[ -z "$NODE_SECRET_KEY" ]]; then
+            [[ "$NON_INTERACTIVE" == true ]] && { log_error "--node-key is required when --existing-node is set"; exit 1; }
+            read -rsp "  Node SECRET_KEY: "; NODE_SECRET_KEY="$REPLY"; echo ""
+        fi
+
+        # Will discover NODE_NAME/COUNTRY_CODE from panel later
+        NODE_NAME="${NODE_NAME:-$(hostname -s | tr '[:lower:]' '[:upper:]')}"
+        TAG_PREFIX="AUTOSNI:$(echo "$NODE_NAME" | tr -c 'A-Z0-9_:' '_')"
     fi
 
-    # NODE_PORT
-    if [[ "$NON_INTERACTIVE" == false ]]; then
-        local _np
-        read -rp "  Node port (panel ↔ node communication) [${NODE_PORT}]: " _np
-        NODE_PORT="${_np:-$NODE_PORT}"
-    fi
-    _validate_port "$NODE_PORT" || { log_error "Invalid node port: ${NODE_PORT}"; exit 1; }
+    # 9. XHTTP path
+    XHTTP_PATH="${XHTTP_PATH_POOL[$RANDOM % ${#XHTTP_PATH_POOL[@]}]}"
 
-    log_info "DOMAIN  : ${DOMAIN}  (cert covers *.node.${DOMAIN})"
-    log_info "NODE    : ${NODE_NAME} @ ${NODE_PUBLIC_IP}:${NODE_PORT}"
+    log_info "DOMAIN  : ${DOMAIN}"
+    log_info "NODE    : ${NODE_NAME}  $(country_flag "$COUNTRY_CODE") $(country_name "$COUNTRY_CODE")"
+    log_info "TAG     : ${TAG_PREFIX}"
     log_info "PANEL   : ${PANEL_URL}"
-    log_info "SNI POL : ${ACTIVE_SNIS}× active × rotate every ${ROTATION_DAYS}d (style: ${SNI_STYLE}, fp: ${DEFAULT_FP})"
+    log_info "SNI POL : ${ACTIVE_SNIS}× active × every ${ROTATION_DAYS}d (style: ${SNI_STYLE}, fp: ${DEFAULT_FP})"
+    log_info "XHTTP   : ${XHTTP_PATH}"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 7 · BASE HARDENING (lifted from server-bootstrap.sh)
+# SECTION 7 · BASE HARDENING
 # ─────────────────────────────────────────────────────────────────────────────
 
 setup_base_packages() {
     log_step "Installing base packages"
     install_packages curl wget git unzip tar jq vim nano htop net-tools dnsutils \
                      iproute2 ufw fail2ban socat tcpdump mtr-tiny ca-certificates \
-                     lsb-release gnupg2 software-properties-common bc psmisc procps
+                     lsb-release gnupg2 software-properties-common bc psmisc procps openssl
     STEP_STATUS["base_packages"]="OK"
 }
 
 setup_sysctl() {
-    log_step "Applying network sysctl (BBR, TCP buffers)"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would write /etc/sysctl.d/99-node-net.conf"
-        STEP_STATUS["sysctl"]="DRY"
-        return 0
-    fi
+    log_step "Applying network sysctl (BBR + TCP tuning)"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would write sysctl"; STEP_STATUS["sysctl"]="DRY"; return 0; }
     cat > /etc/sysctl.d/99-node-net.conf <<'EOF'
-# node-bootstrap network tuning
 net.core.default_qdisc = fq
 net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_rmem = 4096 131072 16777216
@@ -459,30 +657,24 @@ net.ipv4.tcp_max_syn_backlog = 65535
 net.ipv4.icmp_echo_ignore_all = 1
 EOF
     sysctl --system &>/dev/null || true
-    log_ok "Sysctl applied (BBR enabled)"
+    log_ok "Sysctl applied (BBR)"
     STEP_STATUS["sysctl"]="OK"
 }
 
 setup_swap() {
     log_step "Swap configuration"
     if swapon --show | grep -q '^'; then
-        local sz
-        sz="$(swapon --show=SIZE --noheadings | head -1)"
-        log_info "Swap already active (${sz}). Skipping."
+        log_info "Swap already active: $(swapon --show=SIZE --noheadings | head -1). Skipping."
         STEP_STATUS["swap"]="SKIPPED"
         return 0
     fi
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would create 2G swap file at /swapfile"
-        STEP_STATUS["swap"]="DRY"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log_dry "Create 2G swap"; STEP_STATUS["swap"]="DRY"; return 0; }
     fallocate -l 2G /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count=2048
     chmod 600 /swapfile
     mkswap /swapfile >/dev/null
     swapon /swapfile
     grep -q '/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab
-    log_ok "Swap 2G created and enabled"
+    log_ok "Swap 2G enabled"
     STEP_STATUS["swap"]="OK"
 }
 
@@ -495,27 +687,20 @@ _get_ssh_port() {
 
 setup_ssh() {
     log_step "SSH hardening"
-    local sshd_config=/etc/ssh/sshd_config
-    backup_file "$sshd_config"
-    local ssh_port
-    ssh_port="$(_get_ssh_port)"
-    log_info "Detected SSH port: ${ssh_port}"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would set PermitRootLogin prohibit-password, PasswordAuthentication no (if key present)"
-        STEP_STATUS["ssh"]="DRY"
-        return 0
-    fi
-    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' "$sshd_config"
-    sed -i 's/^#*X11Forwarding.*/X11Forwarding no/' "$sshd_config"
-    sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 60/' "$sshd_config"
-    if sshd -t -f "$sshd_config" 2>/dev/null; then
+    backup_file /etc/ssh/sshd_config
+    local sp; sp="$(_get_ssh_port)"
+    log_info "SSH port: ${sp}"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Would harden SSH"; STEP_STATUS["ssh"]="DRY"; return 0; }
+    sed -i 's/^#*PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config
+    sed -i 's/^#*X11Forwarding.*/X11Forwarding no/'                       /etc/ssh/sshd_config
+    sed -i 's/^#*ClientAliveInterval.*/ClientAliveInterval 60/'           /etc/ssh/sshd_config
+    if sshd -t 2>/dev/null; then
         systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true
         log_ok "SSH config applied"
         STEP_STATUS["ssh"]="OK"
     else
-        log_error "sshd -t validation failed — reverting"
-        local b="${BACKUP_DIR}/$(basename $sshd_config).${TIMESTAMP}.bak"
-        [[ -f "$b" ]] && cp -a "$b" "$sshd_config"
+        log_error "sshd -t failed — reverting"
+        cp -a "${BACKUP_DIR}/sshd_config.${TIMESTAMP}.bak" /etc/ssh/sshd_config
         STEP_STATUS["ssh"]="FAILED"
     fi
 }
@@ -523,48 +708,35 @@ setup_ssh() {
 setup_ufw() {
     log_step "Configuring UFW"
     install_packages ufw
-    local ssh_port
-    ssh_port="$(_get_ssh_port)"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would allow SSH(${ssh_port}), 80, 443, ${NODE_PORT}"
-        STEP_STATUS["ufw"]="DRY"
-        return 0
-    fi
-    if [[ "$IS_CONTAINER" == true ]]; then
-        log_warn "Container — UFW may not work. Skipping."
-        STEP_STATUS["ufw"]="SKIPPED(container)"
-        return 0
-    fi
-    ufw --force reset &>/dev/null
-    ufw default deny incoming  &>/dev/null
-    ufw default allow outgoing &>/dev/null
-    ufw allow "${ssh_port}/tcp" comment 'SSH' &>/dev/null
-    ufw allow 80/tcp comment 'ACME HTTP-01 backup + http→https'  &>/dev/null
-    ufw allow 443/tcp comment 'Xray Reality (TLS)' &>/dev/null
-    ufw allow "${NODE_PORT}/tcp" comment 'panel → node' &>/dev/null
-    if ! ufw show added 2>/dev/null | grep -qE "ufw allow ${ssh_port}"; then
-        log_error "SAFETY ABORT: SSH not in UFW rules — refusing to enable"
+    local sp; sp="$(_get_ssh_port)"
+    [[ "$DRY_RUN" == true ]] && { log_dry "UFW: SSH(${sp}), 80, 443, 8443, 9443, ${NODE_PORT}"; STEP_STATUS["ufw"]="DRY"; return 0; }
+    [[ "$IS_CONTAINER" == true ]] && { log_warn "Container — skipping UFW"; STEP_STATUS["ufw"]="SKIPPED(container)"; return 0; }
+    ufw --force reset           &>/dev/null
+    ufw default deny incoming   &>/dev/null
+    ufw default allow outgoing  &>/dev/null
+    ufw allow "${sp}/tcp"       comment 'SSH'                 &>/dev/null
+    ufw allow 80/tcp            comment 'ACME HTTP-01'         &>/dev/null
+    ufw allow 443/tcp           comment 'Xray Reality TCP'     &>/dev/null
+    ufw allow 8443/tcp          comment 'Xray Reality gRPC'    &>/dev/null
+    ufw allow 9443/udp          comment 'Hysteria2'            &>/dev/null
+    ufw allow "${NODE_PORT}/tcp" comment 'panel → node ctrl'   &>/dev/null
+    ufw show added 2>/dev/null | grep -q "ufw allow ${sp}" || {
+        log_error "SAFETY ABORT: SSH not in UFW rules"
         STEP_STATUS["ufw"]="FAILED"
         return 1
-    fi
+    }
     ufw --force enable &>/dev/null
-    log_ok "UFW enabled (ssh:${ssh_port}, 80, 443, node:${NODE_PORT})"
+    log_ok "UFW enabled (ssh:${sp}, 80, 443, 8443, 9443/udp, ${NODE_PORT})"
     STEP_STATUS["ufw"]="OK"
 }
 
 setup_fail2ban() {
     log_step "Configuring Fail2Ban"
     install_packages fail2ban
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would write /etc/fail2ban/jail.local with sshd"
-        STEP_STATUS["fail2ban"]="DRY"
-        return 0
-    fi
-    local jail=/etc/fail2ban/jail.local
-    if [[ ! -s "$jail" ]]; then
-        local ssh_port
-        ssh_port="$(_get_ssh_port)"
-        cat > "$jail" <<EOF
+    [[ "$DRY_RUN" == true ]] && { log_dry "fail2ban jail"; STEP_STATUS["fail2ban"]="DRY"; return 0; }
+    if [[ ! -s /etc/fail2ban/jail.local ]]; then
+        local sp; sp="$(_get_ssh_port)"
+        cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 bantime  = 1h
 findtime = 10m
@@ -574,9 +746,9 @@ ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled = true
-port    = ${ssh_port}
+port    = ${sp}
 EOF
-        log_info "Created jail.local (sshd, port ${ssh_port})"
+        log_info "Created jail.local (sshd, port ${sp})"
     fi
     systemctl enable fail2ban &>/dev/null
     systemctl restart fail2ban
@@ -585,26 +757,21 @@ EOF
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 8 · DOCKER (with distro fallback if get.docker.com is blocked)
+# SECTION 8 · DOCKER
 # ─────────────────────────────────────────────────────────────────────────────
 
 install_docker() {
     log_step "Installing Docker & Compose v2"
     if command -v docker &>/dev/null && docker compose version &>/dev/null 2>&1; then
-        log_ok "Docker + Compose v2 already installed: $(docker --version)"
+        log_ok "Docker present: $(docker --version)"
         STEP_STATUS["docker"]="SKIPPED"
         return 0
     fi
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install Docker (try get.docker.com, fall back to docker.io)"
-        STEP_STATUS["docker"]="DRY"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log_dry "Install Docker"; STEP_STATUS["docker"]="DRY"; return 0; }
 
-    # Clean up any stale apt source that returns 403
     if [[ -f /etc/apt/sources.list.d/docker.list ]] && \
        ! curl -fsS --max-time 5 -I https://download.docker.com/linux/ubuntu/dists/ >/dev/null 2>&1; then
-        log_warn "Stale docker.list pointing at unreachable repo — removing"
+        log_warn "Stale docker.list — removing"
         rm -f /etc/apt/sources.list.d/docker.list /etc/apt/keyrings/docker.gpg 2>/dev/null || true
         apt-get update -qq 2>/dev/null || true
     fi
@@ -615,7 +782,7 @@ install_docker() {
        && sh /tmp/get-docker.sh 2>&1 | tail -10 | sed 's/^/    [docker-installer] /' \
        && command -v docker &>/dev/null; then
         docker_ok=true
-        log_ok "Docker installed via get.docker.com: $(docker --version)"
+        log_ok "Installed via get.docker.com: $(docker --version)"
     fi
     rm -f /tmp/get-docker.sh 2>/dev/null
 
@@ -626,42 +793,32 @@ install_docker() {
         install_packages docker.io docker-compose-v2 || \
             install_packages docker.io docker-compose-plugin || \
             install_packages docker.io
-        if command -v docker &>/dev/null; then
+        command -v docker &>/dev/null && {
             docker_ok=true
-            log_ok "Docker installed from distro: $(docker --version)"
-        fi
+            log_ok "Installed from distro: $(docker --version)"
+        }
     fi
 
-    if [[ "$docker_ok" != true ]]; then
-        log_error "All Docker install paths failed"
-        STEP_STATUS["docker"]="FAILED"
-        return 1
-    fi
+    [[ "$docker_ok" != true ]] && { log_error "Docker install failed"; STEP_STATUS["docker"]="FAILED"; return 1; }
 
     systemctl enable docker &>/dev/null || true
     systemctl start docker &>/dev/null || true
-    if ! docker compose version &>/dev/null; then
+    docker compose version &>/dev/null || {
         install_packages docker-compose-plugin 2>/dev/null || \
-        install_packages docker-compose-v2     2>/dev/null || \
-        log_warn "docker compose plugin still missing"
-    fi
+        install_packages docker-compose-v2     2>/dev/null || true
+    }
     log_ok "Compose: $(docker compose version 2>/dev/null || echo unavailable)"
     STEP_STATUS["docker"]="OK"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 9 · WILDCARD CERT via acme.sh + Cloudflare DNS-01
+# SECTION 9 · CERT — wildcard via acme.sh + Cloudflare DNS-01
 # ─────────────────────────────────────────────────────────────────────────────
 
 setup_cert() {
     log_step "Issuing wildcard cert for *.node.${DOMAIN}"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install acme.sh and issue *.node.${DOMAIN} via Cloudflare DNS-01"
-        STEP_STATUS["cert"]="DRY"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log_dry "acme.sh + CF DNS-01 for *.node.${DOMAIN}"; STEP_STATUS["cert"]="DRY"; return 0; }
 
-    # 1. Install acme.sh if missing
     local acme_home="/root/.acme.sh"
     if [[ ! -x "${acme_home}/acme.sh" ]]; then
         log_info "Installing acme.sh..."
@@ -674,168 +831,163 @@ setup_cert() {
         rm -f /tmp/acme-install.sh
     fi
 
-    # 2. Set Let's Encrypt as default CA
     "${acme_home}/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-
-    # 3. Register account (idempotent)
     "${acme_home}/acme.sh" --register-account -m "admin@${DOMAIN}" >/dev/null 2>&1 || true
 
-    # 4. Issue wildcard cert via Cloudflare DNS-01
     mkdir -p "${NGINX_DIR}/ssl"
-    local fullchain="${NGINX_DIR}/ssl/fullchain.crt"
-    local privkey="${NGINX_DIR}/ssl/private.key"
+    local fullchain="${NGINX_DIR}/ssl/fullchain.pem"
+    local privkey="${NGINX_DIR}/ssl/privkey.pem"
 
-    # If cert already exists and not near expiry, skip
     if [[ -f "$fullchain" ]] && openssl x509 -in "$fullchain" -checkend $((60*86400)) -noout 2>/dev/null; then
-        log_info "Cert exists and valid >60 days — skipping issuance"
-        STEP_STATUS["cert"]="SKIPPED"
-        return 0
+        log_info "Cert valid >60d — skipping issuance"
+    else
+        log_info "Requesting cert (DNS propagation can take ~2min)..."
+        CF_Token="$CF_TOKEN" "${acme_home}/acme.sh" --issue \
+            --dns dns_cf \
+            -d "node.${DOMAIN}" \
+            -d "*.node.${DOMAIN}" \
+            --keylength ec-256 \
+            --server letsencrypt \
+            --force 2>&1 | sed 's/^/    [acme] /' || {
+            log_error "Cert issuance failed — check CF token + zone"
+            STEP_STATUS["cert"]="FAILED"
+            return 1
+        }
+        "${acme_home}/acme.sh" --install-cert \
+            -d "node.${DOMAIN}" --ecc \
+            --fullchain-file "$fullchain" \
+            --key-file "$privkey" \
+            --reloadcmd "docker compose -f ${NGINX_DIR}/docker-compose.yml exec ${NGINX_CONTAINER} nginx -s reload 2>/dev/null || true" \
+            >/dev/null
+        chmod 600 "$privkey"
+        chmod 644 "$fullchain"
+        log_ok "Wildcard cert installed"
     fi
 
-    log_info "Requesting wildcard cert (this can take up to 2 min for DNS propagation)..."
-    CF_Token="$CF_TOKEN" "${acme_home}/acme.sh" --issue \
-        --dns dns_cf \
-        -d "node.${DOMAIN}" \
-        -d "*.node.${DOMAIN}" \
-        --keylength ec-256 \
-        --server letsencrypt \
-        --force 2>&1 | sed 's/^/    [acme] /' || {
-        log_error "acme.sh failed to issue cert — check Cloudflare token & domain"
-        STEP_STATUS["cert"]="FAILED"
-        return 1
-    }
+    # Compat symlink for Hysteria2 config (uses /etc/nginx/ssl/<domain>/ paths)
+    mkdir -p "/etc/nginx/ssl"
+    ln -sfn "${NGINX_DIR}/ssl" "/etc/nginx/ssl/node.${DOMAIN}" 2>/dev/null || true
 
-    # 5. Install cert to nginx path with proper hooks
-    "${acme_home}/acme.sh" --install-cert \
-        -d "node.${DOMAIN}" \
-        --ecc \
-        --fullchain-file "$fullchain" \
-        --key-file "$privkey" \
-        --reloadcmd "docker compose -f ${NGINX_DIR}/docker-compose.yml exec nginx nginx -s reload 2>/dev/null || true" \
-        >/dev/null
-
-    chmod 600 "$privkey"
-    chmod 644 "$fullchain"
-
-    log_ok "Wildcard cert installed at ${NGINX_DIR}/ssl/"
-
-    # 6. Install renewal cron (acme.sh installs its own cron, but we also write a manual renew helper)
+    # Manual renew helper
     cat > "$CERT_RENEW_BIN" <<EOF
 #!/usr/bin/env bash
-# Manual cert renewal — called by 'nstp cert renew'
 set -e
-CF_Token="\$(grep '^CF_TOKEN=' ${STATE_DIR}/secrets.env | cut -d'"' -f2)" \\
-    ${acme_home}/acme.sh --renew -d node.${DOMAIN} --ecc --force
+source ${STATE_DIR}/secrets.env
+CF_Token="\$CF_TOKEN" ${acme_home}/acme.sh --renew -d node.${DOMAIN} --ecc --force
 ${acme_home}/acme.sh --install-cert -d node.${DOMAIN} --ecc \\
     --fullchain-file ${fullchain} \\
     --key-file ${privkey} \\
-    --reloadcmd "docker compose -f ${NGINX_DIR}/docker-compose.yml exec nginx nginx -s reload 2>/dev/null || true"
+    --reloadcmd "docker compose -f ${NGINX_DIR}/docker-compose.yml exec ${NGINX_CONTAINER} nginx -s reload 2>/dev/null || true"
 EOF
     chmod +x "$CERT_RENEW_BIN"
-
     STEP_STATUS["cert"]="OK"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 10 · NGINX SELFSTEAL (unix-socket + wildcard TLS + HTML stub)
+# SECTION 10 · NGINX SELFSTEAL — unix socket + XHTTP gRPC + reject default
 # ─────────────────────────────────────────────────────────────────────────────
 
 setup_nginx_selfsteal() {
-    log_step "Setting up Nginx selfsteal (socket: ${NGINX_SOCK})"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would write ${NGINX_DIR}/{docker-compose.yml,nginx.conf,conf.d/site.conf,html/index.html}"
-        STEP_STATUS["nginx"]="DRY"
-        return 0
-    fi
+    log_step "Setting up Nginx selfsteal (${NGINX_SOCK} + XHTTP via ${XHTTP_SOCK})"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Write nginx config + start container"; STEP_STATUS["nginx"]="DRY"; return 0; }
 
     mkdir -p "${NGINX_DIR}"/{conf.d,html,logs,ssl}
 
-    # 1. Main nginx.conf
-    cat > "${NGINX_DIR}/nginx.conf" <<'NGINX_CONF'
+    # Main nginx.conf — minimal, lets conf.d/site.conf do the work
+    cat > "${NGINX_DIR}/nginx.conf" <<'NGX_MAIN'
 user nginx;
 worker_processes auto;
 worker_rlimit_nofile 65535;
 error_log /var/log/nginx/error.log warn;
 pid /var/run/nginx.pid;
-
 events {
     worker_connections 4096;
     use epoll;
     multi_accept on;
 }
-
 http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
-
-    sendfile        on;
-    tcp_nopush      on;
-    tcp_nodelay     on;
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
     keepalive_timeout 65;
-    types_hash_max_size 2048;
-    server_tokens   off;
+    server_tokens off;
 
-    # Real client IP comes via proxy_protocol header (xver: 1 from Xray)
     set_real_ip_from 127.0.0.1;
     set_real_ip_from unix:;
     real_ip_header proxy_protocol;
 
-    log_format proxy_protocol '$proxy_protocol_addr - $remote_user [$time_local] '
-                              '"$request" $status $body_bytes_sent '
-                              '"$http_referer" "$http_user_agent"';
+    log_format pp '$proxy_protocol_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent';
 
     gzip on;
     gzip_vary on;
     gzip_min_length 1024;
     gzip_types text/plain text/css application/json application/javascript text/xml application/xml;
 
+    map $http_upgrade $connection_upgrade {
+        default upgrade;
+        ""      close;
+    }
+
     include /etc/nginx/conf.d/*.conf;
 }
-NGINX_CONF
+NGX_MAIN
 
-    # 2. Site config — wildcard server_name + unix socket
+    # site.conf — wildcard server_name + XHTTP gRPC pass + reject default
     cat > "${NGINX_DIR}/conf.d/site.conf" <<EOF
-# HTTPS via Unix socket with proxy_protocol (Xray Reality fallback target)
-# Wildcard server_name → any rotated SNI works without nginx reload
+ssl_protocols TLSv1.2 TLSv1.3;
+ssl_ecdh_curve X25519:prime256v1:secp384r1;
+ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+ssl_prefer_server_ciphers on;
+ssl_session_timeout 1d;
+ssl_session_cache shared:MozSSL:10m;
+ssl_session_tickets off;
+
 server {
-    listen unix:${NGINX_SOCK} ssl proxy_protocol http2;
+    listen unix:${NGINX_SOCK} ssl proxy_protocol;
+    http2 on;
     server_name *.node.${DOMAIN} node.${DOMAIN};
 
-    ssl_certificate     /etc/nginx/ssl/fullchain.crt;
-    ssl_certificate_key /etc/nginx/ssl/private.key;
-    ssl_protocols       TLSv1.2 TLSv1.3;
-    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
-    ssl_prefer_server_ciphers off;
-    ssl_session_cache shared:SSL:10m;
-    ssl_session_timeout 1d;
-    ssl_session_tickets off;
-    ssl_stapling on;
-    ssl_stapling_verify on;
-    resolver 1.1.1.1 8.8.8.8 valid=300s;
-
-    access_log /var/log/nginx/access.log proxy_protocol;
-    error_log  /var/log/nginx/error.log warn;
+    ssl_certificate     /etc/nginx/ssl/fullchain.pem;
+    ssl_certificate_key /etc/nginx/ssl/privkey.pem;
+    ssl_trusted_certificate /etc/nginx/ssl/fullchain.pem;
 
     root /usr/share/nginx/html;
     index index.html;
+
+    access_log /var/log/nginx/access.log pp;
+    error_log  /var/log/nginx/error.log warn;
 
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
 
+    location ${XHTTP_PATH} {
+        client_max_body_size 0;
+        grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        client_body_timeout 5m;
+        grpc_read_timeout 315;
+        grpc_send_timeout 5m;
+        grpc_pass unix:${XHTTP_SOCK};
+    }
+
     location / {
         try_files \$uri \$uri/ /index.html;
     }
+}
 
-    location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg)$ {
-        expires 30d;
-        add_header Cache-Control "public, immutable";
-    }
+# Default server — reject unknown SNI
+server {
+    listen unix:${NGINX_SOCK} ssl proxy_protocol default_server;
+    server_name _;
+    ssl_reject_handshake on;
+    return 444;
 }
 EOF
 
-    # 3. HTML stub
-    cat > "${NGINX_DIR}/html/index.html" <<'HTML_STUB'
+    # HTML stub
+    cat > "${NGINX_DIR}/html/index.html" <<'HTML'
 <!doctype html>
 <html lang="en">
 <head>
@@ -857,9 +1009,8 @@ EOF
   </main>
 </body>
 </html>
-HTML_STUB
+HTML
 
-    # 4. docker-compose.yml
     cat > "${NGINX_DIR}/docker-compose.yml" <<EOF
 services:
   nginx:
@@ -881,39 +1032,392 @@ services:
         max-file: "3"
 EOF
 
-    # 5. Bring up
     log_info "Starting nginx container..."
     ( cd "$NGINX_DIR" && docker compose up -d 2>&1 | sed 's/^/    [nginx] /' ) || {
         log_error "Nginx failed to start"
         STEP_STATUS["nginx"]="FAILED"
         return 1
     }
-
     sleep 2
-    if docker ps --format '{{.Names}}' | grep -qx "$NGINX_CONTAINER"; then
-        log_ok "Nginx selfsteal running on ${NGINX_SOCK}"
+    docker ps --format '{{.Names}}' | grep -qx "$NGINX_CONTAINER" && {
+        log_ok "Nginx selfsteal running"
         STEP_STATUS["nginx"]="OK"
-    else
-        log_error "Nginx container not found after start"
+    } || {
+        log_error "Nginx container not visible after start"
         STEP_STATUS["nginx"]="FAILED"
-    fi
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 11 · RW-NODE CONTAINER
+# SECTION 11 · GENERATE REALITY KEYS + HYS PASSWORDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+generate_secrets() {
+    log_step "Generating Reality keypairs + Hysteria passwords"
+    [[ "$DRY_RUN" == true ]] && { log_dry "x25519 + openssl rand"; STEP_STATUS["secrets"]="DRY"; return 0; }
+
+    log_info "Pulling node image (needed for xray x25519 keygen)..."
+    docker pull "$NODE_IMAGE" 2>&1 | tail -2 | sed 's/^/    [pull] /' || {
+        log_error "Failed to pull node image"
+        STEP_STATUS["secrets"]="FAILED"
+        return 1
+    }
+
+    log_info "Generating Reality keypair (TCP inbound)..."
+    local kp; kp="$(reality_keygen)" || return 1
+    REALITY_PRIV_TCP="${kp%%|*}"
+    REALITY_PUB_TCP="${kp##*|}"
+
+    log_info "Generating Reality keypair (gRPC inbound)..."
+    kp="$(reality_keygen)" || return 1
+    REALITY_PRIV_GRPC="${kp%%|*}"
+    REALITY_PUB_GRPC="${kp##*|}"
+
+    HYS_PASSWORD="$(gen_password)"
+    HYS_OBFS_PASSWORD="$(gen_password)"
+
+    log_ok "Secrets generated"
+    STEP_STATUS["secrets"]="OK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 12 · BUILD XRAY CONFIG JSON (template based on user-provided example)
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Args: $1 — initial SNI string
+build_xray_config() {
+    local sni="$1"
+    local tag_main="${COUNTRY_CODE}-${NODE_SEQUENCE}"
+    local tag_grpc="${tag_main}-GRPC"
+    local tag_xhttp="${tag_main}-XHTTP"
+    local tag_hys="${tag_main}-HYS"
+    local hys_cert="/etc/nginx/ssl/node.${DOMAIN}/fullchain.pem"
+    local hys_key="/etc/nginx/ssl/node.${DOMAIN}/privkey.pem"
+
+    jq -n \
+        --arg t1 "$tag_main" --arg t2 "$tag_grpc" --arg t3 "$tag_xhttp" --arg t4 "$tag_hys" \
+        --arg sock "$NGINX_SOCK" --arg xhttp_sock "$XHTTP_SOCK" --arg xhttp_path "$XHTTP_PATH" \
+        --arg sni "$sni" \
+        --arg priv1 "$REALITY_PRIV_TCP" --arg pub1 "$REALITY_PUB_TCP" \
+        --arg priv2 "$REALITY_PRIV_GRPC" --arg pub2 "$REALITY_PUB_GRPC" \
+        --arg fp "$DEFAULT_FP" \
+        --arg hys_pwd "$HYS_PASSWORD" --arg hys_obfs "$HYS_OBFS_PASSWORD" \
+        --arg hys_cert "$hys_cert" --arg hys_key "$hys_key" \
+'{
+  log: {loglevel: "warning"},
+  dns: {
+    servers: ["https://dns.quad9.net/dns-query", "https://dns.google/dns-query", "localhost"],
+    queryStrategy: "UseIPv4"
+  },
+  inbounds: [
+    {
+      tag: $t1,
+      port: 443,
+      protocol: "vless",
+      settings: {clients: [], decryption: "none"},
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]},
+      streamSettings: {
+        network: "raw",
+        security: "reality",
+        realitySettings: {
+          dest: $sock,
+          show: false,
+          xver: 1,
+          spiderX: "",
+          shortIds: [""],
+          publicKey: $pub1,
+          privateKey: $priv1,
+          fingerprint: $fp,
+          serverNames: [$sni]
+        }
+      }
+    },
+    {
+      tag: $t2,
+      port: 8443,
+      protocol: "vless",
+      settings: {clients: [], decryption: "none"},
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]},
+      streamSettings: {
+        network: "grpc",
+        security: "reality",
+        grpcSettings: {serviceName: "grpc-proxy"},
+        realitySettings: {
+          dest: $sock,
+          show: false,
+          xver: 1,
+          spiderX: "",
+          shortIds: [""],
+          publicKey: $pub2,
+          privateKey: $priv2,
+          serverNames: [$sni]
+        }
+      }
+    },
+    {
+      tag: $t3,
+      listen: ($xhttp_sock + ",0666"),
+      protocol: "vless",
+      settings: {clients: [], fallbacks: [], decryption: "none"},
+      sniffing: {enabled: true, destOverride: ["http", "tls", "quic"]},
+      streamSettings: {
+        network: "xhttp",
+        xhttpSettings: {
+          mode: "packet-up",
+          path: $xhttp_path,
+          extra: {noSSEHeader: true, xPaddingBytes: "100-1000", scMaxBufferedPosts: 30, scMaxEachPostBytes: 786432}
+        }
+      }
+    },
+    {
+      tag: $t4,
+      port: 9443,
+      protocol: "hysteria",
+      settings: {
+        obfs: {type: "salamander", password: $hys_obfs},
+        clients: [],
+        version: 2,
+        password: $hys_pwd
+      },
+      streamSettings: {
+        network: "hysteria",
+        security: "tls",
+        sniffing: {enabled: false},
+        tlsSettings: {
+          alpn: ["h3"],
+          certificates: [{keyFile: $hys_key, certificateFile: $hys_cert}]
+        },
+        hysteriaSettings: {version: 2}
+      }
+    }
+  ],
+  outbounds: [
+    {tag: "DIRECT", protocol: "freedom"},
+    {tag: "BLOCK",  protocol: "blackhole"},
+    {tag: "TORRENT",protocol: "blackhole"}
+  ],
+  routing: {
+    rules: [
+      {protocol: ["bittorrent"], outboundTag: "TORRENT"},
+      {protocol: ["quic"],       outboundTag: "BLOCK"},
+      {domain:   ["geosite:private"], outboundTag: "BLOCK"},
+      {ip:       ["geoip:private"],   outboundTag: "BLOCK"}
+    ],
+    domainStrategy: "IPIfNonMatch"
+  }
+}'
+}
+
+# Pick initial SNI value at install time
+generate_initial_sni() {
+    case "${SNI_STYLE}" in
+        cdn)
+            local prefixes=(api cdn docs static web edge assets media swagger supabase)
+            local regions=(fra ams lhr sgp nrt iad lax ord)
+            echo "${prefixes[$RANDOM % ${#prefixes[@]}]}-$((RANDOM % 99 + 1))-${regions[$RANDOM % ${#regions[@]}]}.node.${DOMAIN}"
+            ;;
+        words)
+            echo "blue-river-$((RANDOM % 99 + 1)).node.${DOMAIN}"
+            ;;
+        hex)
+            echo "$(openssl rand -hex 3).node.${DOMAIN}"
+            ;;
+    esac
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 13 · PANEL — create config-profile + node + hosts
+# ─────────────────────────────────────────────────────────────────────────────
+
+setup_panel_resources() {
+    log_step "Creating resources in panel via API"
+    [[ "$DRY_RUN" == true ]] && {
+        log_dry "Would: GET /api/keygen, POST /api/config-profiles, POST /api/nodes, POST /api/hosts ×4"
+        STEP_STATUS["panel"]="DRY"
+        return 0
+    }
+
+    # 1. Get panel pub key (used as SSL_CERT in node .env)
+    log_info "Fetching panel pubKey..."
+    NODE_SECRET_KEY="$(panel_get_keygen)" || {
+        log_error "Failed to GET /api/keygen — token has wrong scope?"
+        STEP_STATUS["panel"]="FAILED"
+        return 1
+    }
+    [[ "$NODE_SECRET_KEY" == "null" || -z "$NODE_SECRET_KEY" ]] && {
+        log_error "/api/keygen returned empty pubKey"
+        STEP_STATUS["panel"]="FAILED"
+        return 1
+    }
+    log_ok "Got panel pubKey ($(echo -n "$NODE_SECRET_KEY" | wc -c) chars)"
+
+    # 2. Build Xray config + create config-profile
+    local initial_sni; initial_sni="$(generate_initial_sni)"
+    log_info "Initial SNI: ${initial_sni}"
+    local xray_cfg; xray_cfg="$(build_xray_config "$initial_sni")"
+
+    local profile_name="${NODE_NAME}"
+    log_info "Creating config-profile '${profile_name}'..."
+    local cp_resp; cp_resp="$(panel_create_config_profile "$profile_name" "$xray_cfg")" || {
+        log_error "Failed to create config-profile"
+        STEP_STATUS["panel"]="FAILED"
+        return 1
+    }
+    CONFIG_PROFILE_UUID="$(echo "$cp_resp" | jq -r '.response.uuid')"
+    log_ok "config-profile UUID: ${CONFIG_PROFILE_UUID}"
+
+    # 3. Extract inbound UUIDs from the profile (panel assigns its own UUIDs)
+    local inbounds; inbounds="$(echo "$cp_resp" | jq -r '.response.inbounds // []')"
+    local tag_main="${COUNTRY_CODE}-${NODE_SEQUENCE}"
+    NODE_INBOUND_REALITY_UUID="$(echo "$inbounds" | jq -r --arg t "$tag_main"       '.[] | select(.tag == $t) | .uuid' | head -1)"
+    NODE_INBOUND_GRPC_UUID="$(echo "$inbounds"    | jq -r --arg t "${tag_main}-GRPC"  '.[] | select(.tag == $t) | .uuid' | head -1)"
+    NODE_INBOUND_XHTTP_UUID="$(echo "$inbounds"   | jq -r --arg t "${tag_main}-XHTTP" '.[] | select(.tag == $t) | .uuid' | head -1)"
+    NODE_INBOUND_HYS_UUID="$(echo "$inbounds"     | jq -r --arg t "${tag_main}-HYS"   '.[] | select(.tag == $t) | .uuid' | head -1)"
+
+    if [[ -z "$NODE_INBOUND_REALITY_UUID" ]]; then
+        # Fallback: take first 4 by index
+        log_warn "Could not match inbounds by tag — falling back to index order"
+        NODE_INBOUND_REALITY_UUID="$(echo "$inbounds" | jq -r '.[0].uuid')"
+        NODE_INBOUND_GRPC_UUID="$(echo "$inbounds"    | jq -r '.[1].uuid')"
+        NODE_INBOUND_XHTTP_UUID="$(echo "$inbounds"   | jq -r '.[2].uuid')"
+        NODE_INBOUND_HYS_UUID="$(echo "$inbounds"     | jq -r '.[3].uuid')"
+    fi
+    log_info "Inbound UUIDs: REALITY=${NODE_INBOUND_REALITY_UUID} GRPC=${NODE_INBOUND_GRPC_UUID} XHTTP=${NODE_INBOUND_XHTTP_UUID} HYS=${NODE_INBOUND_HYS_UUID}"
+
+    # 4. Create node in panel
+    log_info "Registering node '${NODE_NAME}' in panel..."
+    local node_body
+    node_body="$(jq -n \
+        --arg name "$NODE_NAME" \
+        --arg addr "$NODE_PUBLIC_IP" \
+        --arg cc "$COUNTRY_CODE" \
+        --argjson port "$NODE_PORT" \
+        --arg cp "$CONFIG_PROFILE_UUID" \
+        --argjson inbounds "$(jq -n --arg a "$NODE_INBOUND_REALITY_UUID" --arg b "$NODE_INBOUND_GRPC_UUID" --arg c "$NODE_INBOUND_XHTTP_UUID" --arg d "$NODE_INBOUND_HYS_UUID" '[$a,$b,$c,$d]')" \
+        --arg tag "$(echo "${TAG_PREFIX}" | tr -c 'A-Z0-9_:' '_' | head -c 36)" \
+        '{
+            name: $name,
+            address: $addr,
+            port: $port,
+            countryCode: $cc,
+            configProfile: {activeConfigProfileUuid: $cp, activeInbounds: $inbounds},
+            tags: [$tag]
+        }')"
+
+    local node_resp; node_resp="$(panel_create_node "$node_body")" || {
+        log_error "Failed to create node"
+        STEP_STATUS["panel"]="FAILED"
+        return 1
+    }
+    NODE_UUID="$(echo "$node_resp" | jq -r '.response.uuid')"
+    log_ok "Node UUID: ${NODE_UUID}"
+
+    # Persist Initial SNI as our first AUTOSNI record (state file initialized)
+    mkdir -p "$STATE_DIR"
+    local now; now="$(date -Iseconds)"
+    jq -n --arg n "$NODE_UUID" --arg p "$CONFIG_PROFILE_UUID" \
+          --arg rt "$NODE_INBOUND_REALITY_UUID" --arg rg "$NODE_INBOUND_GRPC_UUID" \
+          --arg sni "$initial_sni" --arg now "$now" \
+        '{
+            node_uuid: $n,
+            config_profile_uuid: $p,
+            inbound_reality_uuid: $rt,
+            inbound_grpc_uuid: $rg,
+            active_snis: [{sni: $sni, host_reality_uuid: "", host_grpc_uuid: "", created_at: $now}],
+            last_rotation: $now
+        }' > "${STATE_DIR}/sni.json"
+    chmod 600 "${STATE_DIR}/sni.json"
+
+    STEP_STATUS["panel"]="OK"
+}
+
+# Create 4 hosts (Reality TCP, Reality gRPC, XHTTP, Hysteria) at first install
+setup_initial_hosts() {
+    log_step "Creating initial hosts in panel"
+    [[ "$DRY_RUN" == true ]] && { log_dry "POST /api/hosts × 4"; STEP_STATUS["hosts"]="DRY"; return 0; }
+
+    local sni; sni="$(jq -r '.active_snis[0].sni' "${STATE_DIR}/sni.json")"
+    local flag; flag="$(country_flag "$COUNTRY_CODE")"
+    local cname; cname="$(country_name "$COUNTRY_CODE")"
+    local tag_base="${TAG_PREFIX}"
+
+    # Helper to truncate remark to 40 chars
+    _remark() {
+        local prefix="$1" suffix="$2"
+        local s="[${NODE_NAME}] ${flag} ${cname} · ${suffix}"
+        # If too long, drop country name
+        if (( ${#s} > 40 )); then
+            s="[${NODE_NAME}] ${flag} · ${suffix}"
+        fi
+        # Final fallback
+        if (( ${#s} > 40 )); then
+            s="[${NODE_NAME}] · ${suffix}"
+        fi
+        echo "${s:0:40}"
+    }
+
+    # Reality TCP host
+    local body
+    body="$(jq -n \
+        --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
+        --arg remark "$(_remark "" "REALITY")" --arg addr "$NODE_PUBLIC_IP" \
+        --arg sni "$sni" --arg tag "${tag_base}" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:443,sni:$sni,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+    local resp; resp="$(panel_create_host "$body")" || { log_error "Failed to create Reality TCP host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
+    local h_reality; h_reality="$(echo "$resp" | jq -r '.response.uuid')"
+
+    # Reality gRPC host
+    body="$(jq -n \
+        --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_GRPC_UUID" \
+        --arg remark "$(_remark "" "GRPC")" --arg addr "$NODE_PUBLIC_IP" \
+        --arg sni "$sni" --arg tag "${tag_base}:GRPC" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
+        --arg path "grpc-proxy" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:8443,sni:$sni,path:$path,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+    resp="$(panel_create_host "$body")" || { log_error "Failed to create Reality gRPC host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
+    local h_grpc; h_grpc="$(echo "$resp" | jq -r '.response.uuid')"
+
+    # XHTTP host (any node.<DOMAIN> domain works as SNI since wildcard cert)
+    body="$(jq -n \
+        --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_XHTTP_UUID" \
+        --arg remark "$(_remark "" "XHTTP")" --arg addr "node.${DOMAIN}" \
+        --arg sni "node.${DOMAIN}" --arg tag "${tag_base}:XHTTP" --arg fp "$DEFAULT_FP" --arg node "$NODE_UUID" \
+        --arg path "$XHTTP_PATH" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:443,sni:$sni,path:$path,fingerprint:$fp,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+    resp="$(panel_create_host "$body")" || { log_error "Failed to create XHTTP host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
+    local h_xhttp; h_xhttp="$(echo "$resp" | jq -r '.response.uuid')"
+
+    # Hysteria host (UDP, with TLS — address by domain for SNI match against cert)
+    body="$(jq -n \
+        --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_HYS_UUID" \
+        --arg remark "$(_remark "" "HYS")" --arg addr "node.${DOMAIN}" \
+        --arg sni "node.${DOMAIN}" --arg tag "${tag_base}:HYS" --arg node "$NODE_UUID" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},remark:$remark,address:$addr,port:9443,sni:$sni,tag:$tag,securityLayer:"TLS",nodes:[$node]}')"
+    resp="$(panel_create_host "$body")" || { log_error "Failed to create Hysteria host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
+    local h_hys; h_hys="$(echo "$resp" | jq -r '.response.uuid')"
+
+    # Persist host UUIDs into sni.json
+    jq --arg r "$h_reality" --arg g "$h_grpc" --arg x "$h_xhttp" --arg y "$h_hys" \
+       '.active_snis[0].host_reality_uuid = $r |
+        .active_snis[0].host_grpc_uuid    = $g |
+        .static_hosts                     = {xhttp: $x, hysteria: $y}' \
+       "${STATE_DIR}/sni.json" > "${STATE_DIR}/sni.json.tmp"
+    mv "${STATE_DIR}/sni.json.tmp" "${STATE_DIR}/sni.json"
+    chmod 600 "${STATE_DIR}/sni.json"
+
+    log_ok "Created 4 hosts: REALITY=$h_reality GRPC=$h_grpc XHTTP=$h_xhttp HYS=$h_hys"
+    STEP_STATUS["hosts"]="OK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 14 · NODE CONTAINER (uses NODE_SECRET_KEY obtained above)
 # ─────────────────────────────────────────────────────────────────────────────
 
 setup_node() {
     log_step "Deploying node container '${NODE_CONTAINER}'"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would deploy ${NODE_IMAGE} as '${NODE_CONTAINER}' (host network, /dev/shm mounted)"
-        STEP_STATUS["node"]="DRY"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log_dry "Deploy ${NODE_IMAGE} as ${NODE_CONTAINER}"; STEP_STATUS["node"]="DRY"; return 0; }
+    [[ -z "$NODE_SECRET_KEY" ]] && { log_error "NODE_SECRET_KEY is empty — setup_panel_resources must run first"; STEP_STATUS["node"]="FAILED"; return 1; }
 
     mkdir -p "$NODE_DIR"
-
-    # .env — minimal upstream-required vars
     backup_file "${NODE_DIR}/.env"
     cat > "${NODE_DIR}/.env" <<EOF
 ### NODE — generated $(date -Iseconds) ###
@@ -922,7 +1426,6 @@ SSL_CERT=${NODE_SECRET_KEY}
 EOF
     chmod 600 "${NODE_DIR}/.env"
 
-    # docker-compose.yml — mirrors DigneZzZ remnanode.sh layout
     backup_file "${NODE_DIR}/docker-compose.yml"
     cat > "${NODE_DIR}/docker-compose.yml" <<EOF
 services:
@@ -949,55 +1452,64 @@ services:
         max-file: "5"
 EOF
 
-    log_info "Pulling ${NODE_IMAGE}..."
-    docker pull "$NODE_IMAGE" 2>&1 | tail -3 | sed 's/^/    [pull] /' || {
-        log_error "Failed to pull node image"
-        STEP_STATUS["node"]="FAILED"
-        return 1
-    }
-
     log_info "Starting node container..."
     ( cd "$NODE_DIR" && docker compose up -d 2>&1 | sed 's/^/    [node] /' ) || {
         log_error "Node failed to start"
         STEP_STATUS["node"]="FAILED"
         return 1
     }
-
     sleep 3
-    if docker ps --format '{{.Names}}' | grep -qx "$NODE_CONTAINER"; then
+    docker ps --format '{{.Names}}' | grep -qx "$NODE_CONTAINER" && {
         log_ok "Node container running"
         STEP_STATUS["node"]="OK"
-    else
-        log_error "Node container exited — check 'docker logs ${NODE_CONTAINER}'"
+    } || {
+        log_error "Node exited — check 'docker logs ${NODE_CONTAINER}'"
         STEP_STATUS["node"]="FAILED"
-    fi
+    }
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 12 · NSTP CLI INSTALL
+# SECTION 15 · NSTP CLI + SNI ROTATOR INSTALL
 # ─────────────────────────────────────────────────────────────────────────────
+
+install_sni_rotator() {
+    log_step "Installing SNI rotator"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Install ${SNI_ROTATE_BIN} + cron"; STEP_STATUS["sni_rotator"]="DRY"; return 0; }
+
+    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
+    if [[ -f "${script_dir}/web-sni-rotate" ]]; then
+        cp "${script_dir}/web-sni-rotate" "$SNI_ROTATE_BIN"
+        log_info "Installed rotator from local copy"
+    else
+        log_info "Fetching rotator from ${RAW_BASE}/web-sni-rotate"
+        curl -fsSL "${RAW_BASE}/web-sni-rotate" -o "$SNI_ROTATE_BIN" || {
+            log_error "Failed to download web-sni-rotate"
+            STEP_STATUS["sni_rotator"]="FAILED"
+            return 1
+        }
+    fi
+    chmod +x "$SNI_ROTATE_BIN"
+
+    local rand_min=$((RANDOM % 60))
+    cat > /etc/cron.d/web-sni-rotate <<EOF
+${rand_min} 4 * * * root ${SNI_ROTATE_BIN} rotate >> /var/log/web-sni-rotate.log 2>&1
+EOF
+    chmod 644 /etc/cron.d/web-sni-rotate
+    log_ok "Rotator + cron installed (04:${rand_min} daily)"
+    STEP_STATUS["sni_rotator"]="OK"
+}
 
 install_nstp_cli() {
     log_step "Installing 'nstp' management CLI"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install ${NSTP_BIN}"
-        STEP_STATUS["nstp_cli"]="DRY"
-        return 0
-    fi
+    [[ "$DRY_RUN" == true ]] && { log_dry "Install ${NSTP_BIN}"; STEP_STATUS["nstp_cli"]="DRY"; return 0; }
 
-    cat > "$NSTP_BIN" <<'NSTP_SCRIPT'
+    cat > "$NSTP_BIN" <<'NSTP'
 #!/usr/bin/env bash
-# nstp — node management CLI (installed by node-bootstrap.sh)
 set -euo pipefail
 STATE_DIR="/opt/web/state"
-WEB_DIR="/opt/web"
-NODE_DIR="${WEB_DIR}/node"
-NGINX_DIR="${WEB_DIR}/nginx"
-
-if [[ ! -f "${STATE_DIR}/config.env" ]]; then
-    echo "node-bootstrap state not found at ${STATE_DIR}. Run node-bootstrap.sh first." >&2
-    exit 1
-fi
+NODE_DIR="/opt/web/node"
+NGINX_DIR="/opt/web/nginx"
+[[ -f "${STATE_DIR}/config.env" ]] || { echo "Run node-bootstrap.sh first" >&2; exit 1; }
 # shellcheck disable=SC1091
 source "${STATE_DIR}/config.env"
 [[ -f "${STATE_DIR}/secrets.env" ]] && source "${STATE_DIR}/secrets.env"
@@ -1005,230 +1517,120 @@ source "${STATE_DIR}/config.env"
 CYAN=$'\e[0;36m'; GREEN=$'\e[1;32m'; YELLOW=$'\e[1;33m'; RED=$'\e[1;31m'; RESET=$'\e[0m'; BOLD=$'\e[1m'
 
 cmd_status() {
-    echo -e "${BOLD}Containers:${RESET}"
+    echo -e "${BOLD}Node: ${NODE_NAME} (${COUNTRY_CODE})${RESET}"
     docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | grep -E "web-|NAMES" || true
     echo ""
     echo -e "${BOLD}Cert:${RESET}"
-    local cert="${NGINX_DIR}/ssl/fullchain.crt"
-    if [[ -f "$cert" ]]; then
-        local exp
-        exp="$(openssl x509 -in "$cert" -enddate -noout | cut -d= -f2)"
-        echo "  Expires: $exp"
-    else
-        echo "  (no cert at $cert)"
-    fi
+    local cert="${NGINX_DIR}/ssl/fullchain.pem"
+    [[ -f "$cert" ]] && echo "  Expires: $(openssl x509 -in "$cert" -enddate -noout | cut -d= -f2)" || echo "  (no cert)"
     echo ""
-    echo -e "${BOLD}SNI rotation:${RESET}"
-    if [[ -f "${STATE_DIR}/sni.json" ]]; then
-        cat "${STATE_DIR}/sni.json" 2>/dev/null | sed 's/^/  /'
-    else
-        echo "  (no rotation state yet — run 'nstp sni rotate' to initialize)"
-    fi
+    echo -e "${BOLD}SNI rotation state:${RESET}"
+    [[ -f "${STATE_DIR}/sni.json" ]] && cat "${STATE_DIR}/sni.json" 2>/dev/null | jq '.' | sed 's/^/  /' || echo "  (not initialized)"
 }
-
 cmd_logs() {
     local svc="${1:-all}"
     case "$svc" in
-        node)  docker compose -f "${NODE_DIR}/docker-compose.yml" logs -f ;;
+        node)  docker compose -f "${NODE_DIR}/docker-compose.yml"  logs -f ;;
         nginx) docker compose -f "${NGINX_DIR}/docker-compose.yml" logs -f ;;
-        all|*) docker compose -f "${NODE_DIR}/docker-compose.yml" logs -f &
+        all|*) docker compose -f "${NODE_DIR}/docker-compose.yml"  logs -f &
                docker compose -f "${NGINX_DIR}/docker-compose.yml" logs -f
                wait ;;
     esac
 }
-
 cmd_cert() {
     case "${1:-status}" in
-        status)
-            local cert="${NGINX_DIR}/ssl/fullchain.crt"
-            [[ -f "$cert" ]] || { echo "No cert at $cert"; return 1; }
-            openssl x509 -in "$cert" -text -noout | grep -E "Subject:|DNS:|Not After"
-            ;;
-        renew)
-            [[ -x /usr/local/bin/web-cert-renew ]] || { echo "Renewer not installed"; exit 1; }
-            /usr/local/bin/web-cert-renew
-            ;;
-        *) echo "Usage: nstp cert {status|renew}"; exit 2 ;;
+        status) openssl x509 -in "${NGINX_DIR}/ssl/fullchain.pem" -text -noout | grep -E "Subject:|DNS:|Not After" ;;
+        renew)  [[ -x /usr/local/bin/web-cert-renew ]] && /usr/local/bin/web-cert-renew || echo "renewer missing" ;;
+        *) echo "Usage: nstp cert {status|renew}" ;;
     esac
 }
-
 cmd_sni() {
-    [[ -x /usr/local/bin/web-sni-rotate ]] || { echo "SNI rotator not installed yet (planned for v1.1)"; return 1; }
+    [[ -x /usr/local/bin/web-sni-rotate ]] || { echo "Rotator not installed"; exit 1; }
     case "${1:-list}" in
-        list)   /usr/local/bin/web-sni-rotate list ;;
-        rotate) /usr/local/bin/web-sni-rotate rotate ;;
-        *)      echo "Usage: nstp sni {list|rotate}"; exit 2 ;;
+        list)       /usr/local/bin/web-sni-rotate list ;;
+        rotate)     /usr/local/bin/web-sni-rotate rotate ;;
+        rotate-now) /usr/local/bin/web-sni-rotate rotate-now ;;
+        *) echo "Usage: nstp sni {list|rotate|rotate-now}" ;;
     esac
 }
-
 cmd_fp() {
     case "${1:-show}" in
-        show)
-            echo "Current default fingerprint: ${DEFAULT_FP:-randomized}"
-            ;;
+        show) echo "Default fingerprint: ${DEFAULT_FP:-randomized}" ;;
         set)
-            local new_fp="${2:-}"
-            [[ -z "$new_fp" ]] && { echo "Usage: nstp fp set <chrome|firefox|safari|ios|android|edge|randomized>"; exit 2; }
-            echo "Updating default fingerprint to: $new_fp"
-            sed -i "s|^DEFAULT_FP=.*|DEFAULT_FP=\"${new_fp}\"|" "${STATE_DIR}/config.env"
-            echo "(planned v1.1: PATCH all AUTOSNI hosts in panel via API)"
+            local f="${2:-}"; [[ -z "$f" ]] && { echo "Usage: nstp fp set <chrome|firefox|safari|randomized|...>"; exit 2; }
+            sed -i "s|^DEFAULT_FP=.*|DEFAULT_FP=\"${f}\"|" "${STATE_DIR}/config.env"
+            echo "Updated DEFAULT_FP to ${f}. New hosts will use it. (Bulk update of existing hosts: TODO)"
             ;;
-        *) echo "Usage: nstp fp {show|set <fp>}"; exit 2 ;;
+        *) echo "Usage: nstp fp {show|set <fp>}" ;;
     esac
 }
-
 cmd_update() {
-    echo "Pulling latest images..."
     docker compose -f "${NODE_DIR}/docker-compose.yml"  pull
     docker compose -f "${NGINX_DIR}/docker-compose.yml" pull
     docker compose -f "${NODE_DIR}/docker-compose.yml"  up -d
     docker compose -f "${NGINX_DIR}/docker-compose.yml" up -d
 }
-
 cmd_uninstall() {
-    read -rp "Remove EVERYTHING (containers, /opt/web, certs, CLI)? Type 'yes' to confirm: " ans
+    read -rp "Remove EVERYTHING (containers, /opt/web, certs, CLI)? Type 'yes': " ans
     [[ "$ans" == "yes" ]] || { echo "Aborted"; exit 0; }
     docker compose -f "${NODE_DIR}/docker-compose.yml"  down --volumes 2>/dev/null || true
     docker compose -f "${NGINX_DIR}/docker-compose.yml" down --volumes 2>/dev/null || true
-    rm -rf /opt/web
+    rm -rf /opt/web /etc/nginx/ssl/node.*
     rm -f /usr/local/bin/nstp /usr/local/bin/web-sni-rotate /usr/local/bin/web-cert-renew
     rm -f /etc/cron.d/web-sni-rotate
     echo "Removed."
 }
-
 cmd_menu() {
     while true; do
         echo ""
-        echo -e "${BOLD}nstp — node management${RESET}"
-        echo "  ${CYAN}1)${RESET} status       — containers + cert + sni"
-        echo "  ${CYAN}2)${RESET} logs         — tail all logs"
-        echo "  ${CYAN}3)${RESET} cert status  — show cert expiry"
-        echo "  ${CYAN}4)${RESET} cert renew   — force renewal"
-        echo "  ${CYAN}5)${RESET} sni list     — show active SNIs"
-        echo "  ${CYAN}6)${RESET} sni rotate   — rotate now"
-        echo "  ${CYAN}7)${RESET} update       — pull + restart containers"
-        echo "  ${RED}u)${RESET} uninstall    — remove everything"
+        echo -e "${BOLD}nstp — node management (${NODE_NAME})${RESET}"
+        echo "  ${CYAN}1)${RESET} status        ${CYAN}5)${RESET} sni list"
+        echo "  ${CYAN}2)${RESET} logs all      ${CYAN}6)${RESET} sni rotate (force)"
+        echo "  ${CYAN}3)${RESET} cert status   ${CYAN}7)${RESET} update images"
+        echo "  ${CYAN}4)${RESET} cert renew    ${RED}u)${RESET} uninstall"
         echo "  ${YELLOW}q)${RESET} quit"
         read -rp "  > " c
         case "$c" in
-            1) cmd_status ;;
-            2) cmd_logs all ;;
-            3) cmd_cert status ;;
-            4) cmd_cert renew ;;
-            5) cmd_sni list ;;
-            6) cmd_sni rotate ;;
-            7) cmd_update ;;
+            1) cmd_status ;; 2) cmd_logs all ;; 3) cmd_cert status ;; 4) cmd_cert renew ;;
+            5) cmd_sni list ;; 6) cmd_sni rotate-now ;; 7) cmd_update ;;
             u|U) cmd_uninstall; break ;;
             q|Q|"") break ;;
         esac
     done
 }
-
 case "${1:-menu}" in
-    status)    cmd_status ;;
-    logs)      shift; cmd_logs "$@" ;;
-    cert)      shift; cmd_cert "$@" ;;
-    sni)       shift; cmd_sni "$@" ;;
-    fp)        shift; cmd_fp "$@" ;;
-    update)    cmd_update ;;
+    status) cmd_status ;;
+    logs) shift; cmd_logs "$@" ;;
+    cert) shift; cmd_cert "$@" ;;
+    sni)  shift; cmd_sni  "$@" ;;
+    fp)   shift; cmd_fp   "$@" ;;
+    update) cmd_update ;;
     uninstall) cmd_uninstall ;;
-    menu|"")   cmd_menu ;;
-    -h|--help)
-        cat <<HELP
+    menu|"") cmd_menu ;;
+    -h|--help) cat <<HELP
 nstp — Node management CLI
 
 Usage:
-  nstp                     interactive menu
-  nstp status              show containers + cert + SNI state
+  nstp                       interactive menu
+  nstp status
   nstp logs [node|nginx|all]
   nstp cert {status|renew}
-  nstp sni  {list|rotate}
+  nstp sni  {list|rotate|rotate-now}
   nstp fp   {show|set <fp>}
-  nstp update              pull + restart
-  nstp uninstall           remove everything (asks confirmation)
+  nstp update
+  nstp uninstall
 HELP
-        ;;
-    *) echo "Unknown command: $1. Try 'nstp --help'"; exit 2 ;;
+;;
+    *) echo "Unknown: $1"; exit 2 ;;
 esac
-NSTP_SCRIPT
-
+NSTP
     chmod +x "$NSTP_BIN"
     log_ok "Installed ${NSTP_BIN}"
     STEP_STATUS["nstp_cli"]="OK"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 12b · SNI ROTATOR INSTALLATION
-# ─────────────────────────────────────────────────────────────────────────────
-
-install_sni_rotator() {
-    log_step "Installing SNI rotator engine"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would install ${SNI_ROTATE_BIN} + cron /etc/cron.d/web-sni-rotate"
-        STEP_STATUS["sni_rotator"]="DRY"
-        return 0
-    fi
-
-    # Source: either alongside this script (cloned repo) or fetched from RAW_BASE
-    local src=""
-    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
-    if [[ -f "${script_dir}/web-sni-rotate" ]]; then
-        src="${script_dir}/web-sni-rotate"
-        log_info "Installing rotator from local copy: ${src}"
-        cp "$src" "$SNI_ROTATE_BIN"
-    else
-        log_info "Fetching rotator from ${RAW_BASE}/web-sni-rotate"
-        if ! curl -fsSL "${RAW_BASE}/web-sni-rotate" -o "$SNI_ROTATE_BIN"; then
-            log_error "Failed to download web-sni-rotate"
-            STEP_STATUS["sni_rotator"]="FAILED"
-            return 1
-        fi
-    fi
-    chmod +x "$SNI_ROTATE_BIN"
-
-    # Daily cron — rotator decides internally whether to act based on ROTATION_DAYS
-    # Random minute in 04:00-04:59 to spread load across multiple nodes
-    local rand_min=$((RANDOM % 60))
-    cat > /etc/cron.d/web-sni-rotate <<EOF
-# node-bootstrap: daily SNI rotation check (acts only when due per ROTATION_DAYS)
-${rand_min} 4 * * * root ${SNI_ROTATE_BIN} rotate >> /var/log/web-sni-rotate.log 2>&1
-EOF
-    chmod 644 /etc/cron.d/web-sni-rotate
-    log_ok "Installed ${SNI_ROTATE_BIN} + cron at 04:${rand_min} daily"
-    STEP_STATUS["sni_rotator"]="OK"
-}
-
-run_initial_sni_setup() {
-    log_step "Bootstrapping first SNI in panel"
-    if [[ "$DRY_RUN" == true ]]; then
-        log_dry "Would run: web-sni-rotate init"
-        return 0
-    fi
-
-    # Need jq + node container up + panel reachable
-    if ! command -v jq &>/dev/null; then
-        log_warn "jq not installed — skipping initial SNI setup. Run 'nstp sni init' manually after installing jq."
-        STEP_STATUS["sni_init"]="SKIPPED"
-        return 0
-    fi
-
-    # Give node container ~10s to register with panel before we ask the panel about it
-    log_info "Waiting ~10s for node to register with panel..."
-    sleep 10
-
-    if "$SNI_ROTATE_BIN" init 2>&1 | sed 's/^/    [sni-init] /'; then
-        log_ok "Initial SNI bootstrapped and pushed to panel"
-        STEP_STATUS["sni_init"]="OK"
-    else
-        log_warn "Initial SNI setup failed (panel may not have registered node yet)."
-        log_warn "Run manually once the node shows as online in the panel:"
-        log_warn "    web-sni-rotate init"
-        STEP_STATUS["sni_init"]="DEFERRED"
-    fi
-}
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SECTION 13 · SUMMARY / UNINSTALL
+# SECTION 16 · SUMMARY
 # ─────────────────────────────────────────────────────────────────────────────
 
 print_summary() {
@@ -1242,28 +1644,29 @@ print_summary() {
         printf "  %-20s ${color}%s${RESET}\n" "$k" "$v"
     done | sort
     echo ""
-    echo -e "  ${BOLD}Next steps:${RESET}"
-    echo "    1. In Remnawave panel: confirm node '${NODE_NAME}' is online"
-    if [[ "${STEP_STATUS[sni_init]:-}" == "DEFERRED" ]]; then
-        echo "    2. Initial SNI was NOT pushed (node not yet visible in panel). Run:"
-        echo "         ${BOLD}web-sni-rotate init${RESET}"
-    else
-        echo "    2. First AUTOSNI host is live in panel — subscribe a test user"
-    fi
-    echo "    3. SNI rotation runs daily via cron (acts only every ${ROTATION_DAYS}d)"
-    echo "    4. ${BOLD}nstp status${RESET} any time to check health"
-    echo "    5. ${BOLD}nstp sni list${RESET} to see active SNIs and next rotation time"
+    echo -e "  ${BOLD}Node:${RESET}      ${NODE_NAME} $(country_flag "$COUNTRY_CODE") $(country_name "$COUNTRY_CODE")"
+    echo -e "  ${BOLD}Panel UUID:${RESET} ${NODE_UUID}"
+    echo -e "  ${BOLD}Profile:${RESET}    ${CONFIG_PROFILE_UUID}"
+    echo ""
+    echo -e "  ${BOLD}Next:${RESET}"
+    echo "    • ${BOLD}nstp status${RESET}      — verify everything green"
+    echo "    • ${BOLD}nstp sni list${RESET}    — current SNI + next rotation time"
+    echo "    • In panel: attach hosts to your squad(s) so users see them"
+    echo "    • SNI rotates every ${ROTATION_DAYS}d via cron (writes new SNI into Reality serverNames + creates fresh hosts)"
     echo ""
 }
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 17 · UNINSTALL
+# ─────────────────────────────────────────────────────────────────────────────
+
 run_uninstall() {
     log_step "UNINSTALL"
-    read -rp "  Remove everything (containers, /opt/web, /usr/local/bin/nstp, cron)? [yes/N]: " ans
+    read -rp "  Remove everything? [yes/N]: " ans
     [[ "$ans" != "yes" ]] && { log_info "Aborted"; return 0; }
-
     [[ -f "${NODE_DIR}/docker-compose.yml"  ]] && ( cd "$NODE_DIR"  && docker compose down --volumes 2>/dev/null || true )
     [[ -f "${NGINX_DIR}/docker-compose.yml" ]] && ( cd "$NGINX_DIR" && docker compose down --volumes 2>/dev/null || true )
-    rm -rf /opt/web
+    rm -rf /opt/web /etc/nginx/ssl/node.*
     rm -f "$NSTP_BIN" "$SNI_ROTATE_BIN" "$CERT_RENEW_BIN"
     rm -f /etc/cron.d/web-sni-rotate
     rm -f /etc/sysctl.d/99-node-net.conf
@@ -1271,7 +1674,7 @@ run_uninstall() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 14 · CLI ARG PARSER
+# SECTION 18 · CLI PARSER
 # ─────────────────────────────────────────────────────────────────────────────
 
 usage() {
@@ -1282,42 +1685,44 @@ ${BOLD}node-bootstrap.sh ${SCRIPT_VERSION}${RESET}
 ${BOLD}Usage:${RESET}
   bash ${SCRIPT_NAME} [OPTIONS]
 
-${BOLD}Required (or asked interactively):${RESET}
+${BOLD}Required:${RESET}
   --domain <d>            base domain (cert covers *.node.<d>)
   --cf-token <t>          Cloudflare API token (Zone:DNS:Edit)
   --panel-url <u>         Remnawave panel URL
   --panel-token <t>       Panel API token
-  --node-key <k>          Node SECRET_KEY from panel
+  --country <CC>          ISO-2 country code (e.g. NL, FI, DE)
 
 ${BOLD}Optional:${RESET}
-  --node-name <n>         node tag value (default: hostname uppercased)
-  --node-port <p>         node bind port (default: ${NODE_PORT})
+  --hosting <name>        hosting suffix (e.g. 1CENT, HETZNER) — appended to node name
+  --seq <NN>              force sequence number (otherwise auto-detected from panel)
+  --node-port <p>         control port for panel ↔ node (default: ${NODE_PORT})
   --rotation-days <n>     SNI rotation cadence (default: ${ROTATION_DAYS})
-  --active-snis <n>       how many SNIs to keep active (default: ${ACTIVE_SNIS})
-  --sni-style <s>         words | cdn | hex (default: ${SNI_STYLE})
+  --active-snis <n>       active SNIs in rotation pool (default: ${ACTIVE_SNIS})
+  --sni-style <s>         cdn | words | hex (default: ${SNI_STYLE})
   --fp <fp>               default fingerprint (default: ${DEFAULT_FP})
-  --with-monitoring       install Node Exporter + Grafana dashboard
   --dry-run               simulate
   --verbose, -v           debug output
   --skip-update           skip apt update
-  --non-interactive, -y   no prompts (all required flags must be set)
+  --non-interactive, -y   no prompts
   --status                show current state and exit
   --uninstall             remove everything
   --help, -h              this help
 
+${BOLD}Existing-node fallback (if node was already created in panel UI):${RESET}
+  --existing-node             enable fallback mode
+  --existing-node-uuid <uuid> existing node UUID in panel
+  --node-key <key>            existing node SECRET_KEY
+
 ${BOLD}Examples:${RESET}
-  # Interactive
-  bash ${SCRIPT_NAME}
+  # Full automatic — creates everything in panel via API:
+  bash ${SCRIPT_NAME} --domain example.com --cf-token cf_xxx \\
+      --panel-url https://panel.example.com --panel-token rw_xxx \\
+      --country NL --hosting 1CENT -y
 
-  # Non-interactive
-  bash ${SCRIPT_NAME} \\
-    --domain example.com \\
-    --cf-token cf_xxx \\
-    --panel-url https://panel.example.com \\
-    --panel-token rw_xxx \\
-    --node-key nk_xxx \\
-    -y
-
+  # Fallback — attach to existing node:
+  bash ${SCRIPT_NAME} --domain example.com --cf-token cf_xxx \\
+      --panel-url https://panel.example.com --panel-token rw_xxx \\
+      --existing-node --existing-node-uuid <uuid> --node-key <KEY> -y
 EOF
 }
 
@@ -1325,32 +1730,35 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             --domain)               DOMAIN="$2";              shift 2 ;;
-            --node-name)            NODE_NAME="$2";           shift 2 ;;
-            --node-port)            NODE_PORT="$2";           shift 2 ;;
             --cf-token)             CF_TOKEN="$2";            shift 2 ;;
             --panel-url)            PANEL_URL="$2";           shift 2 ;;
             --panel-token)          PANEL_API_TOKEN="$2";     shift 2 ;;
-            --node-key)             NODE_SECRET_KEY="$2";     shift 2 ;;
+            --country)              COUNTRY_CODE="${2^^}";    shift 2 ;;
+            --hosting)              HOSTING="${2^^}";         shift 2 ;;
+            --seq)                  NODE_SEQUENCE="$2";       shift 2 ;;
+            --node-port)            NODE_PORT="$2";           shift 2 ;;
             --rotation-days)        ROTATION_DAYS="$2";       shift 2 ;;
             --active-snis)          ACTIVE_SNIS="$2";         shift 2 ;;
             --sni-style)            SNI_STYLE="$2";           shift 2 ;;
             --fp)                   DEFAULT_FP="$2";          shift 2 ;;
-            --with-monitoring)      WITH_MONITORING=true;     shift ;;
+            --existing-node)        USE_EXISTING_NODE=true;   shift ;;
+            --existing-node-uuid)   EXISTING_NODE_UUID="$2";  shift 2 ;;
+            --node-key)             NODE_SECRET_KEY="$2";     shift 2 ;;
             --dry-run)              DRY_RUN=true;             shift ;;
             --verbose|-v)           VERBOSE=true;             shift ;;
             --skip-update)          SKIP_UPDATE=true;         shift ;;
             --non-interactive|-y)   NON_INTERACTIVE=true;     shift ;;
-            --status)               preflight_checks; state_load && print_summary; exit 0 ;;
+            --status)               preflight_checks; [[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"; print_summary; exit 0 ;;
             --uninstall)            UNINSTALL=true;           shift ;;
             --version)              echo "node-bootstrap ${SCRIPT_VERSION}"; exit 0 ;;
             --help|-h)              usage; exit 0 ;;
-            *) log_error "Unknown argument: $1"; usage; exit 2 ;;
+            *)                      log_error "Unknown argument: $1"; usage; exit 2 ;;
         esac
     done
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SECTION 15 · MAIN
+# SECTION 19 · MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 main() {
@@ -1359,15 +1767,8 @@ main() {
     _log_session_header
 
     preflight_checks
-
-    if [[ "$UNINSTALL" == true ]]; then
-        run_uninstall
-        exit 0
-    fi
-
-    if [[ "$DRY_RUN" == true ]]; then
-        log_warn "DRY-RUN — no changes will be made"
-    fi
+    [[ "$UNINSTALL" == true ]] && { run_uninstall; exit 0; }
+    [[ "$DRY_RUN" == true ]] && log_warn "DRY-RUN — no changes will be made"
 
     collect_params
 
@@ -1387,15 +1788,24 @@ main() {
     install_docker
     setup_cert
     setup_nginx_selfsteal
-    setup_node
-    install_nstp_cli
+
+    if [[ "$USE_EXISTING_NODE" == false ]]; then
+        generate_secrets
+        setup_panel_resources       # creates config-profile + node + initializes sni.json
+        setup_node
+        setup_initial_hosts         # creates 4 user-facing hosts
+    else
+        # Existing node — skip panel-side creation
+        log_info "Using existing node UUID=${EXISTING_NODE_UUID}"
+        NODE_UUID="$EXISTING_NODE_UUID"
+        setup_node
+        log_warn "Existing-node mode: hosts NOT auto-created. Run 'web-sni-rotate init' manually after verifying node is online in panel."
+    fi
+
     install_sni_rotator
+    install_nstp_cli
 
-    # Persist state BEFORE attempting initial SNI bootstrap — the rotator reads from it.
     state_save
-
-    run_initial_sni_setup
-
     print_summary
 }
 

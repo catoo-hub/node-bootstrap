@@ -1,158 +1,185 @@
 # node-bootstrap
 
-> One-shot installer + management CLI for a Remnawave **node** with rotating SNI, wildcard TLS via Cloudflare DNS-01, selfsteal masking, and anti-DPI hardening.
+> Production-ready installer + management CLI for a Remnawave **node** with rotating SNI, wildcard TLS via Cloudflare DNS-01, multi-protocol selfsteal (Reality TCP + gRPC + XHTTP + Hysteria2), and full API-driven setup.
 
 ---
 
 ## 🇷🇺 Русский
 
-`node-bootstrap.sh` — production-ready bash-скрипт для развёртывания ноды Remnawave с минимумом ручной работы и максимумом защиты от DPI (в первую очередь ТСПУ).
+`node-bootstrap.sh` (v1.1.0) поднимает Remnawave-ноду «с нуля и через API»: создаёт config-profile, регистрирует ноду в панели, генерирует Reality x25519 ключи и Hysteria пароли локально, создаёт 4 hosts в подписках, ставит ротатор SNI и CLI `nstp`. От оператора требуются только домен Cloudflare и токены панели — никаких ручных правок в UI панели.
 
 ### Что устанавливается на сервер
 
 | Компонент | Назначение |
 |---|---|
-| **Базовая подготовка** | BBR, sysctl, swap, SSH hardening, UFW, fail2ban — лифт из `server-bootstrap.sh` |
-| **mobile443-filter** | анти-скан фильтр на 443 (режим `node`) |
-| **Docker + Compose v2** | с автоматическим fallback на `docker.io` если `get.docker.com` блокируется в регионе |
-| **acme.sh + Cloudflare DNS-01** | wildcard-сертификат `*.node.example.com`, обновление раз в 60 дней |
-| **Nginx (selfsteal)** | в контейнере, биндится **только** на `unix:/dev/shm/nginx.sock`, проксирует на статическую заглушку |
-| **rw-node** (`ghcr.io/remnawave/node:latest`) | под нейтральным именем `web-node` в `/opt/web/node`, `network_mode: host` |
-| **3×3 SNI-ротатор** | держит 3 валидных SNI одновременно, каждые 3 дня заменяет самый старый (жизнь строки = 9 дней) |
-| **Node Exporter + Grafana dashboard** | опционально |
-| **`nstp` CLI** | управляющий инструмент в `/usr/local/bin/nstp` |
+| **Base hardening** | BBR sysctl, swap, SSH harden, UFW, fail2ban |
+| **Docker + Compose v2** | с fallback на `docker.io` если `get.docker.com` отдаёт 403 |
+| **acme.sh + Cloudflare DNS-01** | wildcard `*.node.example.com`, авто-renew |
+| **Nginx selfsteal** | unix-socket `/dev/shm/nginx.sock` с proxy_protocol, wildcard cert; gRPC pass через `/dev/shm/xrxh.socket` для XHTTP; default-server `ssl_reject_handshake on` |
+| **rw-node** (`ghcr.io/remnawave/node:latest`) | нейтральное имя `web-node` в `/opt/web/node`, `network_mode: host` |
+| **4 inbounds** | Reality TCP `:443`, Reality gRPC `:8443`, VLESS-XHTTP через unix-socket, Hysteria2 `:9443/udp` — всё в одной config-profile в панели |
+| **3×3 SNI-ротатор** | каждые 3 дня обновляет `serverNames` в обоих Reality inbound'ах + создаёт 2 свежих host (TCP+gRPC), удаляет 2 самых старых |
+| **`nstp` CLI** | `/usr/local/bin/nstp` — status, logs, cert, sni list/rotate, fp, update, uninstall |
 
 ### Архитектура соединения
 
 ```
-client → :443/IP (rw-node → Xray Reality)
-            ├─ Reality magic (UUID+pbk ok)     →  VLESS user traffic
-            └─ обычный TLS handshake (любой SNI) → unix:/dev/shm/nginx.sock
-                                                    ↓
-                                                  Nginx (TLS на *.node.example.com)
-                                                    ↓
-                                                  статичный HTML stub
+client → :443/IP TCP    (rw-node Xray Reality, raw)        → SNI matches
+            ├─ Reality magic ok                  →  VLESS user traffic
+            └─ обычный TLS handshake             →  unix:/dev/shm/nginx.sock
+                                                       ↓
+                                                  Nginx (wildcard *.node.<domain>)
+                                                       ↓
+                                                  HTML stub
+                                                       │
+                                                       └─ /<XHTTP_PATH> → grpc_pass unix:/dev/shm/xrxh.socket → Xray XHTTP inbound
+
+client → :8443 TCP      (rw-node Xray Reality, gRPC, serviceName=grpc-proxy)
+client → :9443 UDP      (rw-node Xray Hysteria2, TLS с тем же wildcard cert через симлинк /etc/nginx/ssl/node.<DOMAIN>/)
 ```
 
-В Xray Reality `serverNames` живёт **3 строки одновременно** — текущая и две предыдущие. Сертификат wildcard, поэтому любой свежий поддомен сразу валиден.
+Default-server в nginx с `ssl_reject_handshake on` бесшумно дропает запросы с неизвестным SNI — селфстил выглядит как одиночный сайт.
 
 ### Стратегия защиты от блокировок SNI
 
-Гипотеза: ТСПУ блокирует **конкретные строки SNI**, когда детектит на них Reality-трафик. Если SNI заблокирован — новые соединения с этой строкой висят / RST, но **другие SNI на той же ноде продолжают работать**.
+Гипотеза: ТСПУ блокирует конкретные **строки** SNI после детекта Reality-трафика. При наличии 3 одновременно валидных SNI в `serverNames` — блокировка одной не убивает ноду.
 
-Ротатор `nstp sni rotate` (по умолчанию — крон раз в 3 дня):
+Ротатор работает **раз в день** через крон (`/etc/cron.d/web-sni-rotate` в 04:xx), но физическое изменение делает только когда прошло `ROTATION_DAYS` (по умолчанию 3) с последней ротации. Это значит:
 
-1. Генерирует новый поддомен в стиле «обычный сабдомен»: `api`, `cdn`, `docs`, `web`, `static`, `edge-3-fra` и т.п.
-2. Добавляет его в `serverNames` inbound через `PATCH /api/config-profiles/inbounds/{uuid}` (новый SNI становится первым → новые подписки получают его)
-3. Удаляет самый старый из `serverNames`
-4. Создаёт host через `POST /api/hosts` с `tag: AUTOSNI:<имя_ноды>` и новым SNI
-5. Удаляет старейший host с тем же тегом (старше 9 дней)
-6. Дёргает `POST /api/nodes/{uuid}/actions/restart` — нода подтягивает обновлённый конфиг из панели
+- **3 SNI активны одновременно**, каждый живёт **9 дней**
+- При ротации: новый SNI prepend'ится, самый старый дропается
+- Subscription URL юзера получает **2 свежих host** (Reality TCP + gRPC с новым SNI) и **2 статичных** (XHTTP + Hysteria, без ротации)
+- Существующие подписки клиентов с уже выданным SNI продолжают работать, пока не истечёт активный пул
 
-Старые подписки клиентов с уже выданным SNI продолжают работать, пока этот SNI не выйдет из активной тройки.
-
-**FP по умолчанию = `randomized`** (uTLS генерирует разный fingerprint на каждое подключение). Если зацепят конкретный FP — `nstp fp set <chrome|firefox|safari|randomized>` массово обновит все AUTO-SNI хосты.
+**Fingerprint по умолчанию — `randomized`** (uTLS меняет FP на каждом подключении). Если блочат конкретный FP — `nstp fp set <fp>` сменит default; новые хосты будут с новым значением.
 
 ### Что нужно подготовить заранее
 
-1. **DNS-зона в Cloudflare** для базового домена (`example.com`), под который пойдёт wildcard `*.node.example.com`
-2. **Cloudflare API Token** со скоупом `Zone:DNS:Edit` для конкретной зоны (Cloudflare Dashboard → My Profile → API Tokens)
-3. **Remnawave Panel URL** и **Panel API Token** (Settings → API Tokens)
-4. **Node KEY** из панели (Nodes → Create new node → скопировать SECRET_KEY)
+1. **DNS-зона в Cloudflare** для базового домена (`example.com`)
+2. **Cloudflare API Token** со scope `Zone:DNS:Edit` для этой зоны (Cloudflare → My Profile → API Tokens → Create Token → Custom)
+3. **Remnawave Panel URL** и **Panel API Token** (Settings → API Tokens — с правом создавать ноды, профили и хосты)
+
+**Не нужно создавать ноду в панели вручную** — скрипт это делает сам через API.
 
 ### Установка
 
+**Интерактивно:**
 ```bash
-# Интерактивно (с меню и подсказками)
 bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main/node-bootstrap.sh)
+```
 
-# Неинтерактивно
+**Неинтерактивно:**
+```bash
 sudo bash node-bootstrap.sh \
     --domain example.com \
-    --cf-token <CLOUDFLARE_TOKEN> \
+    --cf-token cf_xxx \
     --panel-url https://panel.example.com \
-    --panel-token <PANEL_API_TOKEN> \
-    --node-key <NODE_SECRET_KEY> \
+    --panel-token rw_xxx \
+    --country NL \
+    --hosting 1CENT \
     --non-interactive
 ```
 
-После установки в системе появится команда `nstp`:
+Скрипт сам:
+- Определит **следующий sequence number** для страны (`NL-01`, `NL-02`, ...)  через `GET /api/nodes`
+- Сгенерирует Reality x25519 keypairs через `docker run xray x25519`
+- Создаст config-profile `NL-02` с 4 inbound'ами (теги: `NL-02`, `NL-02-GRPC`, `NL-02-XHTTP`, `NL-02-HYS`)
+- Зарегистрирует ноду `NL-02-1CENT` с `countryCode: "NL"`
+- Поднимет контейнеры
+- Создаст 4 хоста в подписках с remark `[NL-02-1CENT] 🇳🇱 Netherlands · REALITY` и т.д. (40 chars max, ASCII-safe + 2 emoji-точки)
+- Запустит ротатор
+
+### CLI-флаги
+
+| Флаг | По умолчанию | Описание |
+|---|---|---|
+| `--domain <d>` | (required) | базовый домен для wildcard cert |
+| `--cf-token <t>` | (required) | Cloudflare API Token |
+| `--panel-url <u>` | (required) | URL панели |
+| `--panel-token <t>` | (required) | API token панели |
+| `--country <CC>` | (required) | ISO-2 код страны |
+| `--hosting <s>` | — | hosting suffix (1CENT, HETZNER) |
+| `--seq <NN>` | auto-detect | sequence number |
+| `--node-port <p>` | `2222` | панель ↔ нода control port |
+| `--rotation-days <n>` | `3` | каденс ротации |
+| `--active-snis <n>` | `3` | сколько SNI держать живыми |
+| `--sni-style` | `cdn` | `cdn` \| `words` \| `hex` |
+| `--fp` | `randomized` | default Xray fingerprint |
+| `--dry-run` | — | симуляция |
+| `--verbose, -v` | — | debug |
+| `--non-interactive, -y` | — | без вопросов |
+
+**Fallback на существующую ноду** (если уже создана в UI):
+```bash
+sudo bash node-bootstrap.sh ... --existing-node --existing-node-uuid <uuid> --node-key <SECRET_KEY>
+```
+
+### Управление после установки
 
 ```bash
 nstp                    # интерактивное меню
-nstp status             # health всех контейнеров + текущие SNI
-nstp logs [service]     # docker compose logs -f (node|nginx|all)
-nstp sni list           # текущие активные SNI и время до следующей ротации
-nstp sni rotate         # вручную провернуть ротацию сейчас
-nstp cert status        # сроки сертификатов
-nstp cert renew         # принудительно обновить
-nstp fp set <fp>        # массово сменить fingerprint у AUTO-SNI хостов
-nstp update             # docker compose pull + restart
-nstp uninstall          # снести всё с вопросом подтверждения
+nstp status             # контейнеры + cert + текущие SNI
+nstp logs [node|nginx|all]
+nstp sni list           # активные SNI + время до следующей ротации
+nstp sni rotate-now     # форс-ротация прямо сейчас
+nstp cert status        # сроки сертификата
+nstp cert renew         # форс-renew
+nstp fp set chrome      # сменить default FP (новые хосты получат)
+nstp update             # docker compose pull + up -d
+nstp uninstall          # снести всё (с подтверждением)
 ```
 
-### CLI-флаги установщика
-
-| Флаг | Описание |
-|---|---|
-| `--domain <d>` | базовый домен, под который выпускается wildcard (`example.com` → `*.node.example.com`) |
-| `--node-name <n>` | имя ноды, попадает в тег hosts (`AUTOSNI:NODE01`). По умолчанию — hostname |
-| `--cf-token <t>` | Cloudflare API Token со scope `Zone:DNS:Edit` |
-| `--panel-url <u>` | URL панели Remnawave (`https://panel.example.com`) |
-| `--panel-token <t>` | API Token из панели |
-| `--node-key <k>` | SECRET_KEY ноды из панели |
-| `--rotation-days <n>` | каденс ротации в днях (default: `3`) |
-| `--active-snis <n>` | сколько SNI держать одновременно (default: `3`) |
-| `--sni-style <s>` | стиль имён: `words` \| `cdn` \| `hex` (default: `cdn`) |
-| `--fp <fp>` | default fingerprint: `randomized` \| `chrome` \| ... (default: `randomized`) |
-| `--with-monitoring` | поставить Node Exporter + Grafana dashboard |
-| `--dry-run` | симуляция, ничего не меняет |
-| `--verbose` | debug-уровень логов |
-| `--non-interactive`, `-y` | без интерактивных вопросов |
-| `--status` | вывести состояние и выйти |
-| `--uninstall` | интерактивное удаление |
-| `--help` | справка |
-
-### Что находится на диске после установки
+### Структура на диске
 
 ```
 /opt/web/
 ├── node/                       — rw-node (контейнер 'web-node')
 │   ├── docker-compose.yml
-│   └── .env                    — NODE_PORT, SECRET_KEY (mode 600)
+│   └── .env                    — APP_PORT, SSL_CERT (mode 600)
 ├── nginx/                      — selfsteal
 │   ├── docker-compose.yml
 │   ├── nginx.conf
-│   ├── conf.d/site.conf
-│   ├── html/                   — статичная заглушка
-│   ├── ssl/                    — wildcard cert + key (mode 600)
+│   ├── conf.d/site.conf        — wildcard server_name + XHTTP gRPC pass + reject default
+│   ├── html/index.html         — статичная заглушка
+│   ├── ssl/                    — wildcard cert + key
 │   └── logs/
 └── state/
-    ├── sni.json                — текущие 3 активных SNI + host UUIDs
     ├── config.env              — параметры установки
+    ├── secrets.env             — токены (CF, Panel, Node KEY)
+    ├── sni.json                — текущие 3 активных SNI + UUID хостов + static_hosts
     └── version
 
-/etc/cron.d/web-sni-rotate      — крон каждое утро (но физически ротация раз в 3 дня)
+/etc/nginx/ssl/node.<DOMAIN>/   — симлинк → /opt/web/nginx/ssl/  (для Hysteria2 совместимости)
+/etc/cron.d/web-sni-rotate      — крон ежедневно в 04:xx
 /usr/local/bin/nstp             — CLI
+/usr/local/bin/web-sni-rotate   — ротатор
+/usr/local/bin/web-cert-renew   — renew helper
 /var/log/node-bootstrap.log
+/var/log/web-sni-rotate.log
 ```
 
-Все каталоги названы нейтрально (`web` / `node`), без слов `remnawave` / `xray` / `vless` — только то, что внутри `docker-compose.yml` (имя образа `ghcr.io/remnawave/node:latest`) обязательно остаётся.
+Все каталоги названы нейтрально (`web` / `node`). В docker-compose.yml единственное упоминание upstream — `image: ghcr.io/remnawave/node:latest`.
+
+### Что НЕ делается автоматически
+
+- **Привязка к squads** — после установки в панели надо вручную (или через `internal-squads` API) указать, какие squads видят созданные хосты. По умолчанию хосты доступны всем.
+- **Monitoring (Node Exporter + Grafana dashboard)** — планируется в v1.2
 
 ### Удаление
 
 ```bash
-nstp uninstall               # или
-bash node-bootstrap.sh --uninstall
+nstp uninstall   # или bash node-bootstrap.sh --uninstall
 ```
 
-Останавливает контейнеры, удаляет `/opt/web/*`, чистит docker volumes, убирает кроны и CLI. Backup-папка `/var/backups/node-bootstrap/` остаётся (чтобы можно было откатиться руками).
+Гасит контейнеры, удаляет `/opt/web/*`, симлинки, cron и CLI. Backups в `/var/backups/node-bootstrap/` остаются.
+
+**Внимание:** удаление не трогает ресурсы в самой панели Remnawave — config-profile, node-запись и созданные хосты надо удалить вручную через UI или API.
 
 ---
 
 ## English
 
-(coming soon — see Russian section above for full reference)
+(coming — see Russian section above for full reference)
 
 ---
 
@@ -162,5 +189,5 @@ MIT — see [LICENSE](./LICENSE).
 
 ## Related
 
-- [`catoo-hub/server-bootstrap`](https://github.com/catoo-hub/server-bootstrap) — sibling project for relay/gate/base server setup.
-- [Remnawave docs](https://docs.rw/) — panel API reference.
+- [`catoo-hub/server-bootstrap`](https://github.com/catoo-hub/server-bootstrap) — sibling project for relay/gate/base server setup
+- [Remnawave docs](https://docs.rw/) — panel API reference

@@ -822,13 +822,30 @@ setup_cert() {
     local acme_home="/root/.acme.sh"
     if [[ ! -x "${acme_home}/acme.sh" ]]; then
         log_info "Installing acme.sh..."
-        curl -fsSL https://get.acme.sh -o /tmp/acme-install.sh
-        sh /tmp/acme-install.sh --install-online >/dev/null 2>&1 || {
-            log_error "acme.sh install failed"
+        # Clean any half-broken previous install
+        rm -rf "$acme_home" 2>/dev/null || true
+
+        if ! curl -fsSL https://get.acme.sh -o /tmp/acme-install.sh; then
+            log_error "Failed to download acme.sh installer from get.acme.sh"
             STEP_STATUS["cert"]="FAILED"
             return 1
-        }
+        fi
+
+        # The official acme.sh installer expects `email=...` as an argument
+        # (NOT --install-online — that flag doesn't exist).
+        # Run it verbosely so any error is visible; then verify the binary landed.
+        local acme_out
+        acme_out="$(sh /tmp/acme-install.sh email="admin@${DOMAIN}" 2>&1)"
         rm -f /tmp/acme-install.sh
+
+        if [[ ! -x "${acme_home}/acme.sh" ]]; then
+            log_error "acme.sh installer ran but ${acme_home}/acme.sh was not created."
+            log_error "Installer output (last 20 lines):"
+            echo "$acme_out" | tail -20 | sed 's/^/    [acme-installer] /' >&2
+            STEP_STATUS["cert"]="FAILED"
+            return 1
+        fi
+        log_ok "acme.sh installed at ${acme_home}"
     fi
 
     "${acme_home}/acme.sh" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
@@ -842,17 +859,28 @@ setup_cert() {
         log_info "Cert valid >60d — skipping issuance"
     else
         log_info "Requesting cert (DNS propagation can take ~2min)..."
+        local acme_log; acme_log="$(mktemp)"
+        local rc=0
         CF_Token="$CF_TOKEN" "${acme_home}/acme.sh" --issue \
             --dns dns_cf \
             -d "node.${DOMAIN}" \
             -d "*.node.${DOMAIN}" \
             --keylength ec-256 \
             --server letsencrypt \
-            --force 2>&1 | sed 's/^/    [acme] /' || {
-            log_error "Cert issuance failed — check CF token + zone"
+            --force 2>&1 | tee "$acme_log" | sed 's/^/    [acme] /' || rc=$?
+        # tee broke the pipefail propagation — re-check the log for known fail markers
+        if (( rc != 0 )) || grep -qE "Error|error issuing certificate|Pending|Could not get certificate" "$acme_log"; then
+            log_error "Cert issuance failed. Last 20 lines of acme.sh output:"
+            tail -20 "$acme_log" | sed 's/^/    [acme] /' >&2
+            log_error "Common causes:"
+            log_error "  • CF token missing 'Zone:DNS:Edit' for zone '${DOMAIN}'"
+            log_error "  • Wrong base domain (you gave '${DOMAIN}', wildcard is for *.node.${DOMAIN})"
+            log_error "  • Let's Encrypt rate limit hit (5 duplicate certs/week)"
+            rm -f "$acme_log"
             STEP_STATUS["cert"]="FAILED"
             return 1
-        }
+        fi
+        rm -f "$acme_log"
         "${acme_home}/acme.sh" --install-cert \
             -d "node.${DOMAIN}" --ecc \
             --fullchain-file "$fullchain" \

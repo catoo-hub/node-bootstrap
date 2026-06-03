@@ -58,7 +58,12 @@ _panel() {
 _chk_line() {
     local sym="$1" name="$2" msg="$3" hint="${4:-}"
     printf "  %b  %-20s ${GRAY}%s${RESET}\n" "$sym" "$name" "$msg"
-    [[ -n "$hint" ]] && printf "      %b%s%b\n" "$YELLOW" "→ $hint" "$RESET"
+    if [[ -n "$hint" ]]; then
+        printf "      %b%s%b\n" "$YELLOW" "→ $hint" "$RESET"
+    fi
+    # Always succeed — `[[ ... ]] && ...` returning 1 when hint is empty would
+    # trip set -e in the caller and abort cmd_diag after the first check.
+    return 0
 }
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -162,6 +167,10 @@ cmd_uninstall() {
 # ────────────────────────────────────────────────────────────────────────────
 
 cmd_diag() {
+    # Disable errexit so a single check failing (e.g. grep returning 1, a
+    # pipefail propagation, a jq null) doesn't abort the whole diagnostic.
+    # Each check is self-contained and prints its own ✓/✗ regardless.
+    set +e
     echo -e "${BOLD}Node diagnostics — ${NODE_NAME}${RESET}"
     echo -e "${GRAY}─────────────────────────────────────────────────────────${RESET}"
 
@@ -365,6 +374,13 @@ JSON
     local exit_ip
     exit_ip="$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:21080 https://api.ipify.org 2>/dev/null || echo '')"
 
+    # If failure, capture xray client logs BEFORE removing the container so we
+    # can show the operator what went wrong (handshake refused, no user, etc.)
+    local client_logs=""
+    if [[ -z "$exit_ip" || "$exit_ip" != "$NODE_PUBLIC_IP" ]]; then
+        client_logs="$(docker logs nstp-test 2>&1 | tail -10 || echo '')"
+    fi
+
     docker rm -f nstp-test >/dev/null 2>&1
     rm -rf "$cfg_dir"
 
@@ -373,9 +389,16 @@ JSON
         return 0
     elif [[ -n "$exit_ip" ]]; then
         printf "  %b  %-10s → exit IP %s  (DOES NOT match node %s)\n" "$WARN" "$proto" "$exit_ip" "$NODE_PUBLIC_IP"
+        printf "      ${GRAY}Test traffic exited via the host's network, not the node — Reality outbound failed.${RESET}\n"
+        [[ -n "$client_logs" ]] && echo "$client_logs" | sed 's/^/      /'
         return 1
     else
         printf "  %b  %-10s → no response (connection failed)\n" "$FAIL" "$proto"
+        if [[ -n "$client_logs" ]]; then
+            printf "      ${GRAY}Last 10 lines of Xray client log:${RESET}\n"
+            echo "$client_logs" | sed 's/^/      /'
+        fi
+        printf "      ${GRAY}Diagnose: ${RESET}check 'nstp diag' for inbound count, and 'docker logs web-node' for empty-inbounds messages\n"
         return 1
     fi
 }

@@ -1603,8 +1603,24 @@ setup_panel_resources() {
     CONFIG_PROFILE_UUID="$(echo "$cp_resp" | jq -r '.response.uuid')"
     log_ok "config-profile UUID: ${CONFIG_PROFILE_UUID}"
 
-    # 3. Extract inbound UUIDs from the profile (panel assigns its own UUIDs)
-    local inbounds; inbounds="$(echo "$cp_resp" | jq -r '.response.inbounds // []')"
+    # 3. Extract inbound UUIDs from the profile (panel assigns its own UUIDs).
+    # The create-profile response sometimes returns inbounds in `.response.inbounds`
+    # (top-level), but on some panel versions they only live nested under
+    # `.response.config.inbounds`. Re-fetch the profile via GET to be sure we
+    # have the authoritative set with panel-assigned UUIDs.
+    log_info "Re-fetching config-profile to read panel-assigned inbound UUIDs..."
+    local cp_full; cp_full="$(panel_req GET "/api/config-profiles/${CONFIG_PROFILE_UUID}")"
+    local inbounds; inbounds="$(echo "$cp_full" | jq -c '.response.inbounds // .response.config.inbounds // []')"
+    local inbounds_count; inbounds_count="$(echo "$inbounds" | jq 'length')"
+    log_info "Profile has ${inbounds_count} inbounds"
+
+    if [[ "$inbounds_count" -lt 4 ]]; then
+        log_error "Expected 4 inbounds, got ${inbounds_count}. Dumping response structure for debugging:"
+        echo "$cp_full" | jq '. | {response_keys: (.response | keys), inbounds_at_response: (.response.inbounds // null | length), inbounds_at_config: (.response.config.inbounds // null | length), first_inbound_sample: (.response.inbounds[0] // .response.config.inbounds[0] // null)}' | sed 's/^/    [debug] /' >&2
+        STEP_STATUS["panel"]="FAILED"
+        return 1
+    fi
+
     local tag_main="${COUNTRY_CODE}-${NODE_SEQUENCE}"
     NODE_INBOUND_REALITY_UUID="$(echo "$inbounds" | jq -r --arg t "$tag_main"       '.[] | select(.tag == $t) | .uuid' | head -1)"
     NODE_INBOUND_GRPC_UUID="$(echo "$inbounds"    | jq -r --arg t "${tag_main}-GRPC"  '.[] | select(.tag == $t) | .uuid' | head -1)"
@@ -1612,13 +1628,26 @@ setup_panel_resources() {
     NODE_INBOUND_HYS_UUID="$(echo "$inbounds"     | jq -r --arg t "${tag_main}-HYS"   '.[] | select(.tag == $t) | .uuid' | head -1)"
 
     if [[ -z "$NODE_INBOUND_REALITY_UUID" ]]; then
-        # Fallback: take first 4 by index
-        log_warn "Could not match inbounds by tag — falling back to index order"
+        log_warn "Could not match inbounds by tag — first inbound has tag='$(echo "$inbounds" | jq -r '.[0].tag')'. Falling back to index order."
         NODE_INBOUND_REALITY_UUID="$(echo "$inbounds" | jq -r '.[0].uuid')"
         NODE_INBOUND_GRPC_UUID="$(echo "$inbounds"    | jq -r '.[1].uuid')"
         NODE_INBOUND_XHTTP_UUID="$(echo "$inbounds"   | jq -r '.[2].uuid')"
         NODE_INBOUND_HYS_UUID="$(echo "$inbounds"     | jq -r '.[3].uuid')"
     fi
+
+    # Final sanity check — make sure every slot ended up with a real UUID
+    for slot in REALITY GRPC XHTTP HYS; do
+        local var="NODE_INBOUND_${slot}_UUID"
+        local val="${!var}"
+        if [[ -z "$val" || "$val" == "null" ]]; then
+            log_error "Could not resolve inbound UUID for slot ${slot}"
+            log_error "Inbound list panel returned:"
+            echo "$inbounds" | jq '.[] | {tag, uuid, type, network, security}' | sed 's/^/    [inbound] /' >&2
+            STEP_STATUS["panel"]="FAILED"
+            return 1
+        fi
+    done
+
     log_info "Inbound UUIDs: REALITY=${NODE_INBOUND_REALITY_UUID} GRPC=${NODE_INBOUND_GRPC_UUID} XHTTP=${NODE_INBOUND_XHTTP_UUID} HYS=${NODE_INBOUND_HYS_UUID}"
 
     # 4. Create node in panel
@@ -1648,6 +1677,24 @@ setup_panel_resources() {
     }
     NODE_UUID="$(echo "$node_resp" | jq -r '.response.uuid')"
     log_ok "Node UUID: ${NODE_UUID}"
+
+    # Verify the node actually got the 4 activeInbounds we sent. The panel will
+    # sometimes silently accept a malformed POST and create the node with an
+    # empty activeInbounds array — which then ships an empty Xray config to
+    # the container, and Xray binds nothing. This catches that early.
+    local node_check; node_check="$(panel_req GET "/api/nodes/${NODE_UUID}" 2>/dev/null || echo '')"
+    local active_count; active_count="$(echo "$node_check" | jq '[.response.configProfile.activeInbounds[]?] | length' 2>/dev/null || echo 0)"
+    if [[ "$active_count" -lt 4 ]]; then
+        log_error "Node was created but configProfile.activeInbounds has only ${active_count} entries (expected 4)."
+        log_error "This means Xray will start with no listeners. The node is unusable."
+        log_error "Node body sent to panel was:"
+        echo "$node_body" | jq '.configProfile' | sed 's/^/    [sent] /' >&2
+        log_error "Panel response for node ${NODE_UUID}:"
+        echo "$node_check" | jq '.response.configProfile' | sed 's/^/    [got] /' >&2
+        STEP_STATUS["panel"]="FAILED"
+        return 1
+    fi
+    log_ok "Node has ${active_count} active inbounds linked"
 
     # Persist Initial SNI as our first AUTOSNI record (state file initialized)
     mkdir -p "$STATE_DIR"

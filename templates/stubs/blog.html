@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Notes</title>
+<style>
+  :root { --bg:#fbf9f4; --fg:#2b2a26; --muted:#7a766b; --accent:#a13c2f; --rule:#e8e3d6; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:Georgia,"Iowan Old Style","Apple Garamond",serif; background:var(--bg); color:var(--fg); line-height:1.7; }
+  .wrap { max-width:660px; margin:0 auto; padding:64px 28px 96px; }
+  header { display:flex; align-items:center; justify-content:space-between; margin-bottom:48px; }
+  .name { font-weight:600; font-size:20px; }
+  nav a { color:var(--muted); text-decoration:none; margin-left:20px; font-size:14px; font-family:Inter,system-ui,sans-serif; }
+  nav a:hover { color:var(--fg); }
+  h1 { font-size:42px; line-height:1.15; margin:0 0 14px; letter-spacing:-0.5px; }
+  .post-meta { color:var(--muted); font-family:Inter,system-ui,sans-serif; font-size:13px; margin-bottom:36px; }
+  article p { font-size:18px; margin:0 0 22px; }
+  article a { color:var(--accent); text-decoration:underline; text-underline-offset:3px; }
+  blockquote { margin:32px 0; padding:8px 22px; border-left:3px solid var(--accent); color:var(--muted); font-style:italic; }
+  hr { border:0; border-top:1px solid var(--rule); margin:60px 0 32px; }
+  .more h2 { font-family:Inter,system-ui,sans-serif; font-weight:600; font-size:13px; text-transform:uppercase; letter-spacing:1px; color:var(--muted); margin-bottom:18px; }
+  .more ul { list-style:none; padding:0; margin:0; }
+  .more li { margin-bottom:14px; }
+  .more a { color:var(--fg); text-decoration:none; font-weight:600; }
+  .more time { color:var(--muted); font-family:Inter,system-ui,sans-serif; font-size:12px; display:block; }
+  footer { color:var(--muted); font-family:Inter,system-ui,sans-serif; font-size:12px; text-align:center; padding:28px; border-top:1px solid var(--rule); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="name">Marius — Notes</div>
+    <nav><a href="#">Archive</a><a href="#">RSS</a><a href="#">About</a></nav>
+  </header>
+  <article>
+    <h1>On keeping a slow inbox</h1>
+    <div class="post-meta">12 min read · April 2026</div>
+    <p>For most of my career I treated email as a queue. Each message was a task to be processed, dispositioned, or deleted. The discipline felt productive. The reality was that I was performing inbox hygiene while the work I was actually paid to do drifted past, untouched.</p>
+    <p>This year I started doing something different. I check email twice a day — once around 11:00, after the morning's deep work, and once around 17:00, before stopping for the evening. The rest of the day, the application is closed.</p>
+    <blockquote>The point isn't to ignore the inbox. The point is to spend the day building, not triaging.</blockquote>
+    <p>Predictably, almost nothing has actually broken. The handful of messages that needed an urgent reply found me by other means — direct message, a hallway tap, an actual phone call. The slow inbox didn't make me unavailable; it made me available <em>only</em> to people who had a real reason to interrupt.</p>
+    <p>I'm not arguing this works for every role. Customer support, sales, and on-call engineers have different constraints. But for the kind of work that compounds — writing, designing, planning — the cost of partial attention is almost always greater than the cost of a delayed reply.</p>
+  </article>
+  <hr>
+  <section class="more">
+    <h2>Other notes</h2>
+    <ul>
+      <li><a href="#">The map is the territory after all</a><time>March 2026</time></li>
+      <li><a href="#">Why I stopped sharpening my saw</a><time>February 2026</time></li>
+      <li><a href="#">A short history of the to-do list</a><time>January 2026</time></li>
+      <li><a href="#">Reading less, thinking more</a><time>December 2025</time></li>
+    </ul>
+  </section>
+</div>
+<footer>marius.cool · written by hand, served from a cabin</footer>
+</body>
+</html>

@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sushi · Delivery</title>
+<style>
+  :root { --bg:#fffaf2; --fg:#1c1a18; --accent:#c4252b; --muted:#7a7268; --card:#fff; --border:#efe6d8; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:"Helvetica Neue",system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { padding:18px 28px; display:flex; align-items:center; justify-content:space-between; border-bottom:1px solid var(--border); background:#fff; }
+  .brand { font-family:Georgia,serif; font-size:22px; font-weight:700; letter-spacing:1px; }
+  .brand span { color:var(--accent); }
+  nav a { color:var(--fg); text-decoration:none; margin-left:22px; font-size:14px; }
+  .order-btn { background:var(--accent); color:#fff; padding:8px 18px; border-radius:999px; font-size:13px; font-weight:600; }
+  .hero { padding:64px 28px; text-align:center; max-width:760px; margin:0 auto; }
+  h1 { font-family:Georgia,serif; font-size:42px; margin:0 0 12px; line-height:1.15; }
+  .sub { color:var(--muted); font-size:16px; margin:0 0 26px; }
+  .cta { background:var(--accent); color:#fff; padding:13px 32px; border:0; border-radius:999px; font-size:15px; font-weight:600; cursor:pointer; }
+  .menu { max-width:1100px; margin:48px auto; padding:0 28px; display:grid; grid-template-columns:repeat(auto-fill,minmax(220px,1fr)); gap:18px; }
+  .item { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:18px; }
+  .swatch { aspect-ratio:1; border-radius:10px; background:linear-gradient(135deg,#ffe7d1,#ffd0d0); margin-bottom:12px; }
+  .name { font-weight:600; font-size:15px; }
+  .desc { color:var(--muted); font-size:12px; margin:4px 0 8px; }
+  .price { color:var(--accent); font-weight:700; }
+  footer { text-align:center; padding:36px; color:var(--muted); font-size:12px; border-top:1px solid var(--border); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">Kyo<span>·</span>kos</div>
+  <nav>
+    <a href="#">Menu</a><a href="#">Sets</a><a href="#">About</a><a href="#">Contacts</a>
+    <a href="#" class="order-btn">Order</a>
+  </nav>
+</header>
+<section class="hero">
+  <h1>Fresh sushi · 25 min delivery</h1>
+  <p class="sub">Hand-rolled in Munich. Made when you order, never before.</p>
+  <button class="cta">Order now</button>
+</section>
+<section class="menu">
+  <div class="item"><div class="swatch"></div><div class="name">Philadelphia Maki</div><div class="desc">Salmon, cream cheese, cucumber · 8 pcs</div><div class="price">€ 12.50</div></div>
+  <div class="item"><div class="swatch"></div><div class="name">Dragon Roll</div><div class="desc">Eel, avocado, sesame · 8 pcs</div><div class="price">€ 16.90</div></div>
+  <div class="item"><div class="swatch"></div><div class="name">Spicy Tuna</div><div class="desc">Tuna, chili oil, tobiko · 6 pcs</div><div class="price">€ 11.00</div></div>
+  <div class="item"><div class="swatch"></div><div class="name">Vegan Box</div><div class="desc">Mango, tofu, daikon · 12 pcs</div><div class="price">€ 14.20</div></div>
+  <div class="item"><div class="swatch"></div><div class="name">California Mix</div><div class="desc">Crab, avocado, masago · 8 pcs</div><div class="price">€ 10.80</div></div>
+  <div class="item"><div class="swatch"></div><div class="name">Family Set</div><div class="desc">42 pcs · share with 3-4 people</div><div class="price">€ 39.00</div></div>
+</section>
+<footer>© 2026 Kyokos · Im Tal 12, München · Mo-So 11:00-22:30</footer>
+</body>
+</html>

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pulse · Analytics for product teams</title>
+<style>
+  :root { --bg:#0b1020; --fg:#e6e9f2; --muted:#8089a6; --accent:#7c5cff; --accent2:#3edab8; --card:#121835; --border:#1f2750; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:Inter,system-ui,sans-serif; background:var(--bg); color:var(--fg); }
+  header { display:flex; align-items:center; justify-content:space-between; padding:18px 36px; border-bottom:1px solid var(--border); }
+  .logo { font-weight:700; font-size:20px; }
+  .logo span { color:var(--accent); }
+  nav a { color:var(--muted); text-decoration:none; margin-right:24px; font-size:14px; }
+  nav a:hover { color:var(--fg); }
+  .btn { background:var(--accent); color:#fff; padding:8px 18px; border-radius:8px; font-weight:600; font-size:13px; }
+  .hero { padding:80px 36px 40px; text-align:center; max-width:880px; margin:0 auto; }
+  h1 { font-size:48px; line-height:1.1; margin:0 0 18px; letter-spacing:-1px; }
+  h1 em { font-style:normal; background:linear-gradient(90deg,var(--accent),var(--accent2)); -webkit-background-clip:text; color:transparent; }
+  .sub { color:var(--muted); font-size:17px; margin:0 0 32px; }
+  .cta { display:inline-flex; gap:12px; }
+  .cta button { padding:12px 26px; border-radius:10px; font-size:14px; font-weight:600; cursor:pointer; border:0; }
+  .cta .primary { background:var(--accent); color:#fff; }
+  .cta .ghost { background:transparent; color:var(--fg); border:1px solid var(--border); }
+  .metrics { max-width:1100px; margin:60px auto; padding:0 36px; display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:16px; }
+  .metric { background:var(--card); border:1px solid var(--border); border-radius:14px; padding:22px; }
+  .label { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:1px; }
+  .value { font-size:32px; font-weight:700; margin:8px 0 4px; }
+  .delta { color:var(--accent2); font-size:13px; }
+  .delta.bad { color:#ff7f7f; }
+  .bars { display:flex; gap:4px; align-items:flex-end; margin-top:14px; height:48px; }
+  .bars div { flex:1; background:linear-gradient(180deg,var(--accent) 0%,transparent 100%); border-radius:3px; opacity:0.85; }
+  footer { color:var(--muted); font-size:12px; text-align:center; padding:32px; border-top:1px solid var(--border); margin-top:60px; }
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">pulse<span>.</span></div>
+  <nav>
+    <a href="#">Product</a><a href="#">Customers</a><a href="#">Pricing</a><a href="#">Docs</a><a href="#">Blog</a>
+    <a href="#" class="btn">Sign in</a>
+  </nav>
+</header>
+<section class="hero">
+  <h1>Ship faster with <em>product analytics</em> that don't slow you down.</h1>
+  <p class="sub">Event tracking, funnels, retention, and cohort analysis — in one place, at warehouse speed.</p>
+  <div class="cta">
+    <button class="primary">Start free trial</button>
+    <button class="ghost">Watch demo (3 min)</button>
+  </div>
+</section>
+<section class="metrics">
+  <div class="metric"><div class="label">Monthly Active</div><div class="value">2.41M</div><div class="delta">▲ 12.4% vs last month</div><div class="bars"><div style="height:40%"></div><div style="height:55%"></div><div style="height:48%"></div><div style="height:72%"></div><div style="height:65%"></div><div style="height:88%"></div><div style="height:100%"></div></div></div>
+  <div class="metric"><div class="label">D7 Retention</div><div class="value">38.2%</div><div class="delta">▲ 1.8 pp</div><div class="bars"><div style="height:60%"></div><div style="height:58%"></div><div style="height:62%"></div><div style="height:64%"></div><div style="height:67%"></div><div style="height:71%"></div><div style="height:73%"></div></div></div>
+  <div class="metric"><div class="label">Conversion</div><div class="value">4.7%</div><div class="delta bad">▼ 0.2 pp</div><div class="bars"><div style="height:80%"></div><div style="height:78%"></div><div style="height:76%"></div><div style="height:72%"></div><div style="height:70%"></div><div style="height:65%"></div><div style="height:64%"></div></div></div>
+  <div class="metric"><div class="label">Sessions/day</div><div class="value">418k</div><div class="delta">▲ 6.1%</div><div class="bars"><div style="height:45%"></div><div style="height:50%"></div><div style="height:62%"></div><div style="height:68%"></div><div style="height:74%"></div><div style="height:80%"></div><div style="height:92%"></div></div></div>
+</section>
+<footer>© 2026 Pulse Analytics · GDPR · DPA · SOC 2 Type II</footer>
+</body>
+</html>

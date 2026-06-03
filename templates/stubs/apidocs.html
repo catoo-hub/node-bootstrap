@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>API Reference</title>
+<style>
+  :root { --bg:#fafbfc; --fg:#1d2127; --muted:#6a737d; --accent:#0366d6; --code-bg:#0d1117; --code-fg:#c9d1d9; --border:#e1e4e8; --sidebar:#fff; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,Inter,sans-serif; background:var(--bg); color:var(--fg); display:grid; grid-template-columns:260px 1fr; min-height:100vh; }
+  aside { background:var(--sidebar); border-right:1px solid var(--border); padding:24px 20px; }
+  .brand { font-weight:700; font-size:16px; margin-bottom:24px; }
+  .brand b { color:var(--accent); }
+  .nav-section { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:1px; margin:18px 0 8px; }
+  .nav-item { display:block; padding:5px 10px; font-size:13px; color:var(--fg); text-decoration:none; border-radius:5px; }
+  .nav-item:hover { background:#f1f3f5; }
+  .nav-item.active { background:rgba(3,102,214,0.1); color:var(--accent); font-weight:600; }
+  main { padding:40px 56px; max-width:880px; }
+  h1 { font-size:30px; margin:0 0 8px; }
+  h2 { font-size:20px; margin:32px 0 12px; padding-bottom:6px; border-bottom:1px solid var(--border); }
+  h3 { font-size:15px; margin:18px 0 6px; }
+  p { color:var(--fg); line-height:1.6; }
+  .endpoint { display:flex; align-items:center; gap:10px; background:#fff; border:1px solid var(--border); border-radius:6px; padding:10px 14px; margin:14px 0; font-family:ui-monospace,SF Mono,Menlo,monospace; font-size:13px; }
+  .method { padding:3px 8px; border-radius:4px; font-size:11px; font-weight:700; color:#fff; }
+  .method.get { background:#28a745; }
+  .method.post { background:#0366d6; }
+  .method.del { background:#d73a49; }
+  .path { color:var(--fg); }
+  pre { background:var(--code-bg); color:var(--code-fg); padding:16px 18px; border-radius:8px; overflow-x:auto; font-size:12.5px; line-height:1.55; }
+  table { width:100%; border-collapse:collapse; margin:8px 0; font-size:13px; }
+  th, td { text-align:left; padding:8px 12px; border-bottom:1px solid var(--border); }
+  th { background:#f6f8fa; font-weight:600; }
+  code { font-family:ui-monospace,SF Mono,monospace; background:#eef1f4; padding:1px 5px; border-radius:3px; font-size:12.5px; }
+</style>
+</head>
+<body>
+<aside>
+  <div class="brand">API <b>Docs</b></div>
+  <div class="nav-section">Getting started</div>
+  <a class="nav-item" href="#">Quickstart</a>
+  <a class="nav-item" href="#">Authentication</a>
+  <a class="nav-item" href="#">Rate limits</a>
+  <div class="nav-section">Resources</div>
+  <a class="nav-item active" href="#">Workspaces</a>
+  <a class="nav-item" href="#">Projects</a>
+  <a class="nav-item" href="#">Members</a>
+  <a class="nav-item" href="#">Webhooks</a>
+  <a class="nav-item" href="#">Activity log</a>
+  <div class="nav-section">SDKs</div>
+  <a class="nav-item" href="#">Node.js</a>
+  <a class="nav-item" href="#">Python</a>
+  <a class="nav-item" href="#">Go</a>
+</aside>
+<main>
+  <h1>Workspaces</h1>
+  <p>A workspace is the top-level container that holds projects and members. Each API token is scoped to a single workspace.</p>
+
+  <h2>List workspaces</h2>
+  <div class="endpoint"><span class="method get">GET</span><span class="path">/v3/workspaces</span></div>
+  <p>Returns up to 100 workspaces accessible to the bearer token. Use <code>cursor</code> to paginate.</p>
+
+  <h3>Query parameters</h3>
+  <table>
+    <tr><th>Name</th><th>Type</th><th>Description</th></tr>
+    <tr><td><code>limit</code></td><td>integer</td><td>1–100. Default: 50.</td></tr>
+    <tr><td><code>cursor</code></td><td>string</td><td>Opaque pagination token from previous response.</td></tr>
+    <tr><td><code>archived</code></td><td>boolean</td><td>Include archived workspaces. Default: false.</td></tr>
+  </table>
+
+  <h3>Response</h3>
+  <pre><code>{
+  "data": [
+    {
+      "id": "ws_4kQp7nLm2",
+      "name": "Acme Corp",
+      "slug": "acme",
+      "tier": "team",
+      "created_at": "2025-08-14T09:22:01Z"
+    }
+  ],
+  "next_cursor": null
+}</code></pre>
+
+  <h2>Create a workspace</h2>
+  <div class="endpoint"><span class="method post">POST</span><span class="path">/v3/workspaces</span></div>
+  <p>Creates a new workspace. Requires <code>workspace:write</code> scope.</p>
+
+  <h2>Delete a workspace</h2>
+  <div class="endpoint"><span class="method del">DELETE</span><span class="path">/v3/workspaces/{id}</span></div>
+  <p>Permanently deletes a workspace and all data associated with it. This action cannot be undone.</p>
+</main>
+</body>
+</html>

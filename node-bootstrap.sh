@@ -97,12 +97,21 @@ REALITY_PUB_TCP=""
 REALITY_PRIV_GRPC=""
 REALITY_PUB_GRPC=""
 
+# Reality short IDs — one per inbound, generated locally via openssl rand -hex 8.
+# Goes into realitySettings.shortIds of the corresponding inbound; panel picks
+# them up when building client subscription URLs.
+SHORT_ID_TCP=""
+SHORT_ID_GRPC=""
+
 # Hysteria2
 HYS_OBFS_PASSWORD=""
 HYS_PASSWORD=""
 
 # XHTTP path — chosen at install time from XHTTP_PATH_POOL
 XHTTP_PATH=""
+
+# Selfsteal stub site — picked randomly from templates/stubs/ at install time
+STUB_NAME=""
 
 # Misc
 NODE_UUID=""               # filled after POST /api/nodes
@@ -428,9 +437,12 @@ REALITY_PRIV_TCP="${REALITY_PRIV_TCP}"
 REALITY_PUB_TCP="${REALITY_PUB_TCP}"
 REALITY_PRIV_GRPC="${REALITY_PRIV_GRPC}"
 REALITY_PUB_GRPC="${REALITY_PUB_GRPC}"
+SHORT_ID_TCP="${SHORT_ID_TCP}"
+SHORT_ID_GRPC="${SHORT_ID_GRPC}"
 
 HYS_PASSWORD="${HYS_PASSWORD}"
 HYS_OBFS_PASSWORD="${HYS_OBFS_PASSWORD}"
+STUB_NAME="${STUB_NAME}"
 EOF
     chmod 600 "$CONFIG_FILE"
 
@@ -1025,30 +1037,28 @@ server {
 }
 EOF
 
-    # HTML stub
-    cat > "${NGINX_DIR}/html/index.html" <<'HTML'
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Service</title>
-<style>
-  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;background:#0d1117;color:#c9d1d9;margin:0;display:flex;min-height:100vh;align-items:center;justify-content:center;text-align:center}
-  .card{max-width:520px;padding:48px 32px}
-  h1{font-size:1.6rem;margin:0 0 12px;font-weight:600}
-  p{color:#8b949e;line-height:1.6;margin:0}
-  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:#3fb950;margin-right:8px;vertical-align:middle}
-</style>
-</head>
-<body>
-  <main class="card">
-    <h1><span class="dot"></span>Service is running</h1>
-    <p>This endpoint is operational. If you reached this page by accident, no action is required.</p>
-  </main>
-</body>
-</html>
+    # HTML stub — pick one of the templates at random.
+    # Templates live in templates/stubs/<name>.html in the repo.
+    # If running from a local clone, copy directly. Otherwise download from RAW_BASE.
+    local stub_templates=(realestate sushi analytics apidocs blog portfolio)
+    STUB_NAME="${stub_templates[$RANDOM % ${#stub_templates[@]}]}"
+    log_info "Selfsteal stub: ${STUB_NAME}"
+
+    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
+    local html_dest="${NGINX_DIR}/html/index.html"
+    if [[ -f "${script_dir}/templates/stubs/${STUB_NAME}.html" ]]; then
+        cp "${script_dir}/templates/stubs/${STUB_NAME}.html" "$html_dest"
+    elif curl -fsSL "${RAW_BASE}/templates/stubs/${STUB_NAME}.html" -o "$html_dest"; then
+        log_info "Fetched stub from ${RAW_BASE}/templates/stubs/${STUB_NAME}.html"
+    else
+        log_warn "Could not fetch stub template — falling back to a minimal placeholder"
+        cat > "$html_dest" <<'HTML'
+<!doctype html><html><head><meta charset="utf-8"><title>Service</title></head>
+<body style="font-family:system-ui;text-align:center;padding:80px">
+<h1>Service</h1><p>The site is running.</p></body></html>
 HTML
+        STUB_NAME="minimal"
+    fi
 
     cat > "${NGINX_DIR}/docker-compose.yml" <<EOF
 services:
@@ -1115,6 +1125,12 @@ generate_secrets() {
     HYS_PASSWORD="$(gen_password)"
     HYS_OBFS_PASSWORD="$(gen_password)"
 
+    # Reality shortIds — 8 bytes (16 hex chars), per inbound.
+    # On the server side this restricts which client shortIds are accepted;
+    # on the client side it must be present in vless:// as `sid=...`.
+    SHORT_ID_TCP="$(openssl rand -hex 8)"
+    SHORT_ID_GRPC="$(openssl rand -hex 8)"
+
     log_ok "Secrets generated"
     STEP_STATUS["secrets"]="OK"
 }
@@ -1140,9 +1156,8 @@ build_xray_config() {
         --arg t1 "$tag_main" --arg t2 "$tag_grpc" --arg t3 "$tag_xhttp" --arg t4 "$tag_hys" \
         --arg sock "$NGINX_SOCK" --arg xhttp_sock "$XHTTP_SOCK" --arg xhttp_path "$XHTTP_PATH" \
         --arg sni "$sni" \
-        --arg priv1 "$REALITY_PRIV_TCP" --arg pub1 "$REALITY_PUB_TCP" \
-        --arg priv2 "$REALITY_PRIV_GRPC" --arg pub2 "$REALITY_PUB_GRPC" \
-        --arg fp "$DEFAULT_FP" \
+        --arg priv1 "$REALITY_PRIV_TCP"  --arg pub1 "$REALITY_PUB_TCP"  --arg sid1 "$SHORT_ID_TCP" \
+        --arg priv2 "$REALITY_PRIV_GRPC" --arg pub2 "$REALITY_PUB_GRPC" --arg sid2 "$SHORT_ID_GRPC" \
         --arg hys_pwd "$HYS_PASSWORD" --arg hys_obfs "$HYS_OBFS_PASSWORD" \
         --arg hys_cert "$hys_cert" --arg hys_key "$hys_key" \
 '{
@@ -1166,10 +1181,9 @@ build_xray_config() {
           show: false,
           xver: 1,
           spiderX: "",
-          shortIds: [""],
+          shortIds: [$sid1],
           publicKey: $pub1,
           privateKey: $priv1,
-          fingerprint: $fp,
           serverNames: [$sni]
         }
       }
@@ -1189,7 +1203,7 @@ build_xray_config() {
           show: false,
           xver: 1,
           spiderX: "",
-          shortIds: [""],
+          shortIds: [$sid2],
           publicKey: $pub2,
           privateKey: $priv2,
           serverNames: [$sni]

@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Studio · Portfolio</title>
+<style>
+  :root { --bg:#fff; --fg:#111; --muted:#666; --accent:#ff5a36; --border:#ececec; }
+  * { box-sizing:border-box; }
+  body { margin:0; font-family:Inter,system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--fg); }
+  nav.top { position:sticky; top:0; background:rgba(255,255,255,0.95); backdrop-filter:saturate(180%) blur(10px); border-bottom:1px solid var(--border); padding:16px 36px; display:flex; align-items:center; justify-content:space-between; z-index:10; }
+  .brand { font-weight:700; letter-spacing:-0.5px; }
+  nav.top a { color:var(--fg); text-decoration:none; margin-left:24px; font-size:14px; }
+  nav.top a:hover { color:var(--accent); }
+  .hero { padding:120px 36px 60px; max-width:1100px; margin:0 auto; }
+  .eyebrow { color:var(--accent); font-size:13px; text-transform:uppercase; letter-spacing:2px; font-weight:600; margin-bottom:18px; }
+  h1 { font-size:72px; line-height:1.05; font-weight:700; letter-spacing:-3px; margin:0 0 24px; max-width:880px; }
+  .lede { color:var(--muted); font-size:20px; max-width:580px; line-height:1.5; margin:0 0 36px; }
+  .meta { display:flex; gap:36px; color:var(--muted); font-size:13px; flex-wrap:wrap; }
+  .meta b { color:var(--fg); display:block; margin-bottom:4px; font-weight:600; }
+  .work { padding:80px 36px; max-width:1100px; margin:0 auto; }
+  .work h2 { font-size:13px; text-transform:uppercase; letter-spacing:2px; color:var(--muted); margin:0 0 24px; }
+  .grid { display:grid; grid-template-columns:repeat(2,1fr); gap:24px; }
+  .card { aspect-ratio:4/5; border-radius:14px; padding:32px; display:flex; flex-direction:column; justify-content:space-between; color:#fff; }
+  .card.c1 { background:linear-gradient(135deg,#1a1a1a,#3a3a3a); }
+  .card.c2 { background:linear-gradient(135deg,#ff5a36,#ffb06a); }
+  .card.c3 { background:linear-gradient(135deg,#0a3d62,#3f78bf); }
+  .card.c4 { background:linear-gradient(135deg,#386641,#a7c957); color:#0d1408; }
+  .card .num { font-weight:700; font-size:13px; opacity:0.7; letter-spacing:2px; }
+  .card .name { font-size:32px; font-weight:700; letter-spacing:-1px; }
+  .card .desc { font-size:14px; opacity:0.85; line-height:1.5; }
+  footer { padding:40px 36px; border-top:1px solid var(--border); display:flex; justify-content:space-between; align-items:center; color:var(--muted); font-size:13px; }
+  footer a { color:var(--fg); text-decoration:none; margin-left:18px; }
+  @media (max-width:720px) { h1 { font-size:44px; letter-spacing:-1.5px; } .grid { grid-template-columns:1fr; } }
+</style>
+</head>
+<body>
+<nav class="top">
+  <div class="brand">Hex Studio</div>
+  <div><a href="#">Work</a><a href="#">Studio</a><a href="#">Journal</a><a href="#">Contact</a></div>
+</nav>
+<section class="hero">
+  <div class="eyebrow">Independent design studio · Lisbon</div>
+  <h1>We design products people return to.</h1>
+  <p class="lede">A small team of designers and engineers helping ambitious founders ship interfaces that hold up under real use.</p>
+  <div class="meta">
+    <div><b>Available</b>Q3 2026</div>
+    <div><b>Engagement</b>2–6 month sprints</div>
+    <div><b>Past clients</b>Patreon, Loom, Anyma, Notion</div>
+  </div>
+</section>
+<section class="work">
+  <h2>Selected work · 2024–2026</h2>
+  <div class="grid">
+    <div class="card c1"><div class="num">01 / Northwave</div><div><div class="name">Onboarding redesign</div><div class="desc">Cut time-to-first-value by 64% across desktop and mobile.</div></div></div>
+    <div class="card c2"><div class="num">02 / Pulley</div><div><div class="name">Brand & product system</div><div class="desc">Identity, design tokens, and a 240-component Figma library.</div></div></div>
+    <div class="card c3"><div class="num">03 / Atrium</div><div><div class="name">Mobile app rebuild</div><div class="desc">Native iOS and Android shipped together in 14 weeks.</div></div></div>
+    <div class="card c4"><div class="num">04 / Kalia</div><div><div class="name">Marketing site</div><div class="desc">Series-A relaunch with motion-first storytelling.</div></div></div>
+  </div>
+</section>
+<footer>
+  <div>© 2026 Hex Studio · Rua de São Paulo 38, Lisboa</div>
+  <div><a href="#">Twitter</a><a href="#">Are.na</a><a href="#">Read.cv</a></div>
+</footer>
+</body>
+</html>

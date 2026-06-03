@@ -1456,10 +1456,18 @@ setup_node() {
 
     mkdir -p "$NODE_DIR"
     backup_file "${NODE_DIR}/.env"
+
+    # The panel pubKey arrives as a multi-line PEM after jq -r decodes the JSON.
+    # docker-compose env_file expects single-line values, so collapse any real
+    # newlines back into literal '\n' sequences. The node app re-expands them.
+    local secret_for_env
+    secret_for_env="$(printf '%s' "$NODE_SECRET_KEY" | awk 'BEGIN{ORS=""}NR>1{printf "\\n"}{printf "%s", $0}')"
+
     cat > "${NODE_DIR}/.env" <<EOF
 ### NODE — generated $(date -Iseconds) ###
-APP_PORT=${NODE_PORT}
-SSL_CERT=${NODE_SECRET_KEY}
+# Variable names below are dictated by the upstream node image and CANNOT be renamed.
+NODE_PORT=${NODE_PORT}
+SECRET_KEY=${secret_for_env}
 EOF
     chmod 600 "${NODE_DIR}/.env"
 
@@ -1495,14 +1503,31 @@ EOF
         STEP_STATUS["node"]="FAILED"
         return 1
     }
-    sleep 3
-    docker ps --format '{{.Names}}' | grep -qx "$NODE_CONTAINER" && {
-        log_ok "Node container running"
-        STEP_STATUS["node"]="OK"
-    } || {
-        log_error "Node exited — check 'docker logs ${NODE_CONTAINER}'"
+
+    # Give the app a few seconds to either come up or crash-loop on env validation
+    sleep 6
+
+    # Check container is up AND has been running for at least a few seconds (i.e.
+    # not stuck in a fast restart loop due to bad env vars).
+    if ! docker ps --format '{{.Names}}' | grep -qx "$NODE_CONTAINER"; then
+        log_error "Node container is not visible in 'docker ps'"
         STEP_STATUS["node"]="FAILED"
-    }
+        return 1
+    fi
+
+    local restart_count uptime_sec
+    restart_count="$(docker inspect --format '{{.RestartCount}}' "$NODE_CONTAINER" 2>/dev/null || echo 0)"
+    if (( restart_count > 1 )); then
+        log_error "Node container is in a restart loop (RestartCount=${restart_count})."
+        log_error "Last 20 log lines from the container:"
+        docker logs --tail 20 "$NODE_CONTAINER" 2>&1 | sed 's/^/    [node] /' >&2
+        log_error "Fix: check ${NODE_DIR}/.env, ensure NODE_PORT and SECRET_KEY are set correctly."
+        STEP_STATUS["node"]="FAILED"
+        return 1
+    fi
+
+    log_ok "Node container running (RestartCount=${restart_count})"
+    STEP_STATUS["node"]="OK"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────

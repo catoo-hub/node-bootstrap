@@ -55,6 +55,7 @@ NON_INTERACTIVE=false
 SKIP_UPDATE=false
 UNINSTALL=false
 WITH_MONITORING=false
+MONITOR_FROM_IP=""         # IP of the panel/Prometheus server allowed to scrape :9100
 
 # Required params
 DOMAIN=""                  # example.com — wildcard base
@@ -789,29 +790,147 @@ setup_ufw() {
 }
 
 setup_fail2ban() {
-    log_step "Configuring Fail2Ban"
+    log_step "Configuring Fail2Ban (sshd + web-nginx scanners)"
     install_packages fail2ban
-    [[ "$DRY_RUN" == true ]] && { log_dry "fail2ban jail"; STEP_STATUS["fail2ban"]="DRY"; return 0; }
-    if [[ ! -s /etc/fail2ban/jail.local ]]; then
-        local sp; sp="$(_get_ssh_port)"
-        cat > /etc/fail2ban/jail.local <<EOF
+    [[ "$DRY_RUN" == true ]] && { log_dry "fail2ban jails"; STEP_STATUS["fail2ban"]="DRY"; return 0; }
+
+    local sp; sp="$(_get_ssh_port)"
+
+    # Filter that matches nginx 405 (try_files POST on unknown XHTTP paths) and
+    # 444 (ssl_reject_handshake on unknown SNI). Both signal scanners probing
+    # for proxy endpoints — legitimate clients never hit either status.
+    cat > /etc/fail2ban/filter.d/web-nginx.conf <<'F2B'
+[Definition]
+# Log format from our site.conf:
+#   $proxy_protocol_addr - $remote_user [$time_local] "$request" $status $size
+failregex = ^<HOST>\s.*"(?:POST|GET|HEAD|PUT|DELETE)[^"]*"\s(?:405|444)\s
+ignoreregex =
+F2B
+
+    cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
 bantime  = 1h
 findtime = 10m
 maxretry = 5
 backend  = systemd
-ignoreip = 127.0.0.1/8 ::1
+ignoreip = 127.0.0.1/8 ::1 ${NODE_PUBLIC_IP}
 
 [sshd]
 enabled = true
 port    = ${sp}
+
+[web-nginx]
+enabled  = true
+filter   = web-nginx
+port     = 80,443
+logpath  = /opt/web/nginx/logs/access.log
+maxretry = 20
+findtime = 1h
+bantime  = 6h
 EOF
-        log_info "Created jail.local (sshd, port ${sp})"
-    fi
+    log_info "Created jail.local (sshd:${sp} + web-nginx 20/h → 6h ban)"
     systemctl enable fail2ban &>/dev/null
     systemctl restart fail2ban
-    log_ok "Fail2Ban running"
+    log_ok "Fail2Ban running with 2 jails"
     STEP_STATUS["fail2ban"]="OK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7b · LOG ROTATION
+# ─────────────────────────────────────────────────────────────────────────────
+
+setup_logrotate() {
+    log_step "Setting up logrotate for nginx + xray"
+    [[ "$DRY_RUN" == true ]] && { log_dry "logrotate configs"; STEP_STATUS["logrotate"]="DRY"; return 0; }
+    install_packages logrotate
+
+    # Nginx access/error logs — written to host bind mount, easy to rotate.
+    # Send a nginx -s reopen signal after rotation so new file handles are taken.
+    cat > /etc/logrotate.d/web-nginx <<EOF
+${NGINX_DIR}/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    sharedscripts
+    postrotate
+        docker compose -f ${NGINX_DIR}/docker-compose.yml exec -T ${NGINX_CONTAINER} nginx -s reopen 2>/dev/null || true
+    endscript
+}
+EOF
+
+    # Xray supervisor logs — mounted from container to host (see setup_node).
+    # No signal needed — supervisord rotates files internally per restart.
+    cat > /etc/logrotate.d/web-node <<EOF
+${NODE_DIR}/logs/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+    copytruncate
+}
+EOF
+
+    log_ok "logrotate configured (14 days retention, daily, gzip)"
+    STEP_STATUS["logrotate"]="OK"
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SECTION 7c · NODE EXPORTER (Prometheus)
+# Only enabled if --monitor-from <ip> is passed; opens 9100 from that IP only.
+# Operator runs Grafana on their own panel server and imports the dashboard
+# JSON from templates/grafana/node-dashboard.json in this repo.
+# ─────────────────────────────────────────────────────────────────────────────
+
+setup_node_exporter() {
+    [[ -z "${MONITOR_FROM_IP:-}" ]] && return 0
+    log_step "Installing node_exporter (allow scrape from ${MONITOR_FROM_IP})"
+    [[ "$DRY_RUN" == true ]] && { log_dry "Deploy node_exporter on :9100"; STEP_STATUS["node_exporter"]="DRY"; return 0; }
+
+    mkdir -p /opt/web/monitoring
+    cat > /opt/web/monitoring/docker-compose.yml <<'YAML'
+services:
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    container_name: web-node-exporter
+    restart: unless-stopped
+    network_mode: host
+    pid: host
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.sysfs=/host/sys'
+      - '--path.rootfs=/rootfs'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc|var/lib/docker)($$|/)'
+      - '--web.listen-address=:9100'
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+YAML
+
+    # UFW: allow scrape only from panel server IP
+    if [[ "$IS_CONTAINER" != true ]]; then
+        ufw allow from "${MONITOR_FROM_IP}" to any port 9100 proto tcp \
+            comment "node_exporter scrape from panel" &>/dev/null || true
+    fi
+
+    ( cd /opt/web/monitoring && docker compose up -d 2>&1 | sed 's/^/    [exporter] /' ) || {
+        log_error "node_exporter failed to start"
+        STEP_STATUS["node_exporter"]="FAILED"
+        return 1
+    }
+    log_ok "node_exporter on :9100 (UFW: only from ${MONITOR_FROM_IP})"
+    echo ""
+    log_info "Grafana dashboard template:"
+    log_info "  ${RAW_BASE}/templates/grafana/node-dashboard.json"
+    log_info "Import in your Grafana → set Prometheus target to: ${NODE_PUBLIC_IP}:9100"
+    STEP_STATUS["node_exporter"]="OK"
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1699,7 +1818,7 @@ setup_node() {
     [[ "$DRY_RUN" == true ]] && { log_dry "Deploy ${NODE_IMAGE} as ${NODE_CONTAINER}"; STEP_STATUS["node"]="DRY"; return 0; }
     [[ -z "$NODE_SECRET_KEY" ]] && { log_error "NODE_SECRET_KEY is empty — setup_panel_resources must run first"; STEP_STATUS["node"]="FAILED"; return 1; }
 
-    mkdir -p "$NODE_DIR"
+    mkdir -p "$NODE_DIR" "$NODE_DIR/logs"
     backup_file "${NODE_DIR}/.env"
 
     # The panel pubKey arrives as a multi-line PEM after jq -r decodes the JSON.
@@ -1739,6 +1858,8 @@ services:
       # read it for the Hysteria2 inbound's tlsSettings. Nginx serves the same
       # files from its own /etc/nginx/ssl mount.
       - ${NGINX_DIR}/ssl:/etc/xray/cert:ro
+      # Mount supervisor's log dir to host so logrotate can rotate xray.out.log
+      - ${NODE_DIR}/logs:/var/log/supervisor
     logging:
       driver: json-file
       options:
@@ -1814,131 +1935,25 @@ install_nstp_cli() {
     log_step "Installing 'nstp' management CLI"
     [[ "$DRY_RUN" == true ]] && { log_dry "Install ${NSTP_BIN}"; STEP_STATUS["nstp_cli"]="DRY"; return 0; }
 
-    cat > "$NSTP_BIN" <<'NSTP'
-#!/usr/bin/env bash
-set -euo pipefail
-STATE_DIR="/opt/web/state"
-NODE_DIR="/opt/web/node"
-NGINX_DIR="/opt/web/nginx"
-[[ -f "${STATE_DIR}/config.env" ]] || { echo "Run node-bootstrap.sh first" >&2; exit 1; }
-# shellcheck disable=SC1091
-source "${STATE_DIR}/config.env"
-[[ -f "${STATE_DIR}/secrets.env" ]] && source "${STATE_DIR}/secrets.env"
-
-CYAN=$'\e[0;36m'; GREEN=$'\e[1;32m'; YELLOW=$'\e[1;33m'; RED=$'\e[1;31m'; RESET=$'\e[0m'; BOLD=$'\e[1m'
-
-cmd_status() {
-    echo -e "${BOLD}Node: ${NODE_NAME} (${COUNTRY_CODE})${RESET}"
-    docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Image}}' | grep -E "web-|NAMES" || true
-    echo ""
-    echo -e "${BOLD}Cert:${RESET}"
-    local cert="${NGINX_DIR}/ssl/fullchain.pem"
-    [[ -f "$cert" ]] && echo "  Expires: $(openssl x509 -in "$cert" -enddate -noout | cut -d= -f2)" || echo "  (no cert)"
-    echo ""
-    echo -e "${BOLD}SNI rotation state:${RESET}"
-    [[ -f "${STATE_DIR}/sni.json" ]] && cat "${STATE_DIR}/sni.json" 2>/dev/null | jq '.' | sed 's/^/  /' || echo "  (not initialized)"
-}
-cmd_logs() {
-    local svc="${1:-all}"
-    case "$svc" in
-        node)  docker compose -f "${NODE_DIR}/docker-compose.yml"  logs -f ;;
-        nginx) docker compose -f "${NGINX_DIR}/docker-compose.yml" logs -f ;;
-        all|*) docker compose -f "${NODE_DIR}/docker-compose.yml"  logs -f &
-               docker compose -f "${NGINX_DIR}/docker-compose.yml" logs -f
-               wait ;;
-    esac
-}
-cmd_cert() {
-    case "${1:-status}" in
-        status) openssl x509 -in "${NGINX_DIR}/ssl/fullchain.pem" -text -noout | grep -E "Subject:|DNS:|Not After" ;;
-        renew)  [[ -x /usr/local/bin/web-cert-renew ]] && /usr/local/bin/web-cert-renew || echo "renewer missing" ;;
-        *) echo "Usage: nstp cert {status|renew}" ;;
-    esac
-}
-cmd_sni() {
-    [[ -x /usr/local/bin/web-sni-rotate ]] || { echo "Rotator not installed"; exit 1; }
-    case "${1:-list}" in
-        list)       /usr/local/bin/web-sni-rotate list ;;
-        rotate)     /usr/local/bin/web-sni-rotate rotate ;;
-        rotate-now) /usr/local/bin/web-sni-rotate rotate-now ;;
-        *) echo "Usage: nstp sni {list|rotate|rotate-now}" ;;
-    esac
-}
-cmd_fp() {
-    case "${1:-show}" in
-        show) echo "Default fingerprint: ${DEFAULT_FP:-randomized}" ;;
-        set)
-            local f="${2:-}"; [[ -z "$f" ]] && { echo "Usage: nstp fp set <chrome|firefox|safari|randomized|...>"; exit 2; }
-            sed -i "s|^DEFAULT_FP=.*|DEFAULT_FP=\"${f}\"|" "${STATE_DIR}/config.env"
-            echo "Updated DEFAULT_FP to ${f}. New hosts will use it. (Bulk update of existing hosts: TODO)"
-            ;;
-        *) echo "Usage: nstp fp {show|set <fp>}" ;;
-    esac
-}
-cmd_update() {
-    docker compose -f "${NODE_DIR}/docker-compose.yml"  pull
-    docker compose -f "${NGINX_DIR}/docker-compose.yml" pull
-    docker compose -f "${NODE_DIR}/docker-compose.yml"  up -d
-    docker compose -f "${NGINX_DIR}/docker-compose.yml" up -d
-}
-cmd_uninstall() {
-    read -rp "Remove EVERYTHING (containers, /opt/web, certs, CLI)? Type 'yes': " ans
-    [[ "$ans" == "yes" ]] || { echo "Aborted"; exit 0; }
-    docker compose -f "${NODE_DIR}/docker-compose.yml"  down --volumes 2>/dev/null || true
-    docker compose -f "${NGINX_DIR}/docker-compose.yml" down --volumes 2>/dev/null || true
-    rm -rf /opt/web /etc/nginx/ssl/node.*
-    rm -f /usr/local/bin/nstp /usr/local/bin/web-sni-rotate /usr/local/bin/web-cert-renew
-    rm -f /etc/cron.d/web-sni-rotate
-    echo "Removed."
-}
-cmd_menu() {
-    while true; do
-        echo ""
-        echo -e "${BOLD}nstp — node management (${NODE_NAME})${RESET}"
-        echo "  ${CYAN}1)${RESET} status        ${CYAN}5)${RESET} sni list"
-        echo "  ${CYAN}2)${RESET} logs all      ${CYAN}6)${RESET} sni rotate (force)"
-        echo "  ${CYAN}3)${RESET} cert status   ${CYAN}7)${RESET} update images"
-        echo "  ${CYAN}4)${RESET} cert renew    ${RED}u)${RESET} uninstall"
-        echo "  ${YELLOW}q)${RESET} quit"
-        read -rp "  > " c
-        case "$c" in
-            1) cmd_status ;; 2) cmd_logs all ;; 3) cmd_cert status ;; 4) cmd_cert renew ;;
-            5) cmd_sni list ;; 6) cmd_sni rotate-now ;; 7) cmd_update ;;
-            u|U) cmd_uninstall; break ;;
-            q|Q|"") break ;;
-        esac
-    done
-}
-case "${1:-menu}" in
-    status) cmd_status ;;
-    logs) shift; cmd_logs "$@" ;;
-    cert) shift; cmd_cert "$@" ;;
-    sni)  shift; cmd_sni  "$@" ;;
-    fp)   shift; cmd_fp   "$@" ;;
-    update) cmd_update ;;
-    uninstall) cmd_uninstall ;;
-    menu|"") cmd_menu ;;
-    -h|--help) cat <<HELP
-nstp — Node management CLI
-
-Usage:
-  nstp                       interactive menu
-  nstp status
-  nstp logs [node|nginx|all]
-  nstp cert {status|renew}
-  nstp sni  {list|rotate|rotate-now}
-  nstp fp   {show|set <fp>}
-  nstp update
-  nstp uninstall
-HELP
-;;
-    *) echo "Unknown: $1"; exit 2 ;;
-esac
-NSTP
+    # Source nstp from a local clone if available; otherwise fetch from RAW_BASE.
+    local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
+    if [[ -f "${script_dir}/nstp" ]]; then
+        cp "${script_dir}/nstp" "$NSTP_BIN"
+        log_info "Installed nstp from local copy"
+    elif curl -fsSL "${RAW_BASE}/nstp" -o "$NSTP_BIN"; then
+        log_info "Fetched nstp from ${RAW_BASE}/nstp"
+    else
+        log_error "Could not install nstp CLI"
+        STEP_STATUS["nstp_cli"]="FAILED"
+        return 1
+    fi
     chmod +x "$NSTP_BIN"
     log_ok "Installed ${NSTP_BIN}"
     STEP_STATUS["nstp_cli"]="OK"
+    return 0
 }
+
+# Stale heredoc — kept commented for reference until next refactor pass.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 16 · SUMMARY
@@ -2052,6 +2067,7 @@ parse_args() {
             --active-snis)          ACTIVE_SNIS="$2";         shift 2 ;;
             --sni-style)            SNI_STYLE="$2";           shift 2 ;;
             --fp)                   DEFAULT_FP="$2";          shift 2 ;;
+            --monitor-from)         MONITOR_FROM_IP="$2";     shift 2 ;;
             --existing-node)        USE_EXISTING_NODE=true;   shift ;;
             --existing-node-uuid)   EXISTING_NODE_UUID="$2";  shift 2 ;;
             --node-key)             NODE_SECRET_KEY="$2";     shift 2 ;;
@@ -2116,6 +2132,8 @@ main() {
 
     install_sni_rotator
     install_nstp_cli
+    setup_logrotate
+    setup_node_exporter   # no-op unless --monitor-from <ip> is set
 
     state_save
     print_summary

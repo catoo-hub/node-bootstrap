@@ -84,7 +84,14 @@ NODE_INBOUND_HYS_UUID=""
 ROTATION_DAYS=3
 ACTIVE_SNIS=3
 SNI_STYLE="cdn"            # cdn | words | hex
-DEFAULT_FP="randomized"    # randomized | chrome | firefox | safari | ios | android | edge | qq
+DEFAULT_FP="firefox"       # firefox (default) | chrome | edge | safari | ios | android | qq | randomized
+# Reasoning (June 2026 research):
+#   - JA4+ defeats randomized-mode by sorting TLS extensions before hashing.
+#     uTLS randomized produces statistical anomalies real users never show.
+#   - chrome is universally targeted on RU mobile carriers (operator reports).
+#   - firefox: non-Chromium TLS profile, smaller target population, currently
+#     the best signal/noise tradeoff for RU traffic.
+#   - edge is a reasonable alternative; switch via `nstp fp set edge`.
 
 # Node container
 # Default to a high "looks like ephemeral / app port" range. 2222 (SSH alt) and
@@ -1234,11 +1241,19 @@ NGX_MAIN
     cat > "${NGINX_DIR}/conf.d/site.conf" <<EOF
 ssl_protocols TLSv1.2 TLSv1.3;
 ssl_ecdh_curve X25519:prime256v1:secp384r1;
+# Cipher order matches Cloudflare's TLS 1.2/1.3 server preference (canonical
+# "modern" recipe). Real CDNs use this exact order — DPI fingerprinting that
+# scores cipher-suite ordering as a signal should see "looks like Cloudflare".
 ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
 ssl_prefer_server_ciphers on;
 ssl_session_timeout 1d;
-ssl_session_cache shared:MozSSL:10m;
-ssl_session_tickets off;
+# Session cache name is what's burned into the shared memory zone — rename
+# off MozSSL to avoid trivial fingerprinting via cache zone size + name.
+ssl_session_cache shared:SSL:50m;
+# Session tickets ON: IPLogs research (2026) flagged "session ticket length
+# differs from real site" as a Reality-vs-real signal in active probing.
+# Without tickets we'd send no ticket — real sites usually do send one.
+ssl_session_tickets on;
 
 # HTTP → HTTPS redirect on port 80 (no proxy_protocol — direct TCP).
 # Nginx in host network mode can bind 0.0.0.0:80 directly.
@@ -1277,6 +1292,29 @@ server {
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+    # Cloudflare-style response headers — DPI grep-detection that triggers
+    # on "Server: nginx + no CF-RAY" gets confused. The Alt-Svc tells the
+    # client HTTP/3 is available on :443 — same as every real CDN site.
+    add_header Alt-Svc 'h3=":443"; ma=86400' always;
+    set \$cf_ray \$request_id\$msec;
+    add_header CF-Cache-Status DYNAMIC always;
+    add_header CF-RAY "\$cf_ray" always;
+
+    # Fake static assets that the stub HTML references. Real sites serve
+    # CSS/JS bundles from CDN; if the stub returns 404 for /static/*.js
+    # an active probe sees "site references resources that don't exist" —
+    # selfsteal tell. Return tiny realistic-looking responses so the page
+    # appears whole.
+    location ~ ^/static/[^/]+\.js$ {
+        default_type application/javascript;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        return 200 "/* (c) 2026 */\n!function(){var e={env:\"production\"};window.__APP=e;}();\n";
+    }
+    location ~ ^/static/[^/]+\.css$ {
+        default_type text/css;
+        add_header Cache-Control "public, max-age=31536000, immutable" always;
+        return 200 "/* */\n:root{--bg:#0d1117}body{margin:0}\n";
+    }
 
     location ${XHTTP_PATH} {
         client_max_body_size 0;
@@ -1729,7 +1767,7 @@ _xhttp_extra_json() {
     "hMaxReusableSecs": "600-900"
   },
   "noGRPCHeader": false,
-  "xPaddingBytes": "100-500",
+  "xPaddingBytes": "100-1000",
   "scMaxEachPostBytes": "393216-786432"
 }
 JSON

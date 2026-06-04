@@ -130,11 +130,60 @@ cmd_sni() {
 
 cmd_fp() {
     case "${1:-show}" in
-        show) echo "Default fingerprint: ${DEFAULT_FP:-randomized}" ;;
+        show) echo "Default fingerprint: ${DEFAULT_FP:-firefox}" ;;
         set)
-            local f="${2:-}"; [[ -z "$f" ]] && { echo "Usage: nstp fp set <chrome|firefox|safari|randomized|...>"; exit 2; }
+            local f="${2:-}"
+            [[ -z "$f" ]] && { echo "Usage: nstp fp set <firefox|chrome|edge|safari|ios|android|qq|randomized>"; exit 2; }
+
+            # Validate value matches the Remnawave enum (mistype = panel 400 on every PATCH)
+            case "$f" in
+                chrome|firefox|safari|ios|android|edge|qq|random|randomized) ;;
+                *) echo "${RED}Invalid fingerprint '$f'${RESET}. Allowed: firefox chrome edge safari ios android qq random randomized"; exit 2 ;;
+            esac
+
+            # 1) Persist as default for any future host creation
             sed -i "s|^DEFAULT_FP=.*|DEFAULT_FP=\"${f}\"|" "${STATE_DIR}/config.env"
-            echo "Updated DEFAULT_FP=${f}. New hosts use it; bulk update of existing TODO."
+            echo "Updated DEFAULT_FP=${f} in config.env"
+
+            # 2) Collect all host UUIDs from state and PATCH each.
+            #    Source: active_snis[].host_reality_uuid + host_grpc_uuid (rotated)
+            #          + static_hosts.xhttp + static_hosts.hysteria (fixed)
+            local uuids
+            uuids="$(jq -r '
+                ([.active_snis[]? | .host_reality_uuid, .host_grpc_uuid] +
+                 [.static_hosts.xhttp, .static_hosts.hysteria])
+                | map(select(. != null and . != "" and . != "null"))
+                | .[]
+            ' "${STATE_DIR}/sni.json" 2>/dev/null)"
+
+            if [[ -z "$uuids" ]]; then
+                echo "${YELLOW}No host UUIDs in sni.json — nothing to bulk-update${RESET}"
+                return 0
+            fi
+
+            local count=0 fail=0
+            while read -r uuid; do
+                [[ -z "$uuid" ]] && continue
+                local body; body="$(jq -n --arg u "$uuid" --arg fp "$f" '{uuid:$u, fingerprint:$fp}')"
+                if _panel PATCH /api/hosts "$body" >/dev/null 2>&1; then
+                    count=$((count + 1))
+                else
+                    fail=$((fail + 1))
+                    echo "  ${RED}✗${RESET} PATCH /api/hosts uuid=$uuid failed"
+                fi
+            done <<< "$uuids"
+
+            if (( fail == 0 )); then
+                echo "${GREEN}✓${RESET} Patched ${count} host(s) to fingerprint=${f}"
+            else
+                echo "${YELLOW}Patched ${count} host(s), ${fail} failed${RESET}"
+            fi
+
+            # 3) Tell node to refresh client lists
+            if [[ -n "${NODE_UUID:-}" ]]; then
+                _panel POST "/api/nodes/${NODE_UUID}/actions/restart" "{}" >/dev/null 2>&1 \
+                    && echo "${GREEN}✓${RESET} Restart triggered — new fingerprint takes effect on reconnect"
+            fi
             ;;
         *) echo "Usage: nstp fp {show|set <fp>}"; exit 2 ;;
     esac

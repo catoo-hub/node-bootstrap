@@ -216,8 +216,19 @@ cmd_diag() {
         # Fetch panel hosts, find AUTOSNI:*:XHTTP one, check its path
         local hosts_resp; hosts_resp="$(_panel GET /api/hosts 2>/dev/null || echo '')"
         if [[ -n "$hosts_resp" ]]; then
-            panel_path="$(echo "$hosts_resp" | jq -r --arg ib "$NODE_INBOUND_XHTTP_UUID" \
-                '.response.hosts[]? // .response[]? | select(.inbound.configProfileInboundUuid==$ib or .configProfileInboundUuid==$ib) | .path' | head -1)"
+            # /api/hosts has two shapes across panel versions:
+            #   - {"response": [...hosts...]}        (response is array)
+            #   - {"response": {"hosts": [...]}}    (response is object with .hosts)
+            # `.response.hosts[]?` errors out if .response is an array (Cannot index
+            # array with string), and `?` doesn't catch that. Switch on type.
+            panel_path="$(echo "$hosts_resp" | jq -r --arg ib "$NODE_INBOUND_XHTTP_UUID" '
+                (if (.response | type) == "array" then .response
+                 elif (.response.hosts | type) == "array" then .response.hosts
+                 else [] end)
+                | .[]
+                | select((.inbound.configProfileInboundUuid // .configProfileInboundUuid // "") == $ib)
+                | .path
+            ' 2>/dev/null | head -1)"
             if [[ "$nginx_path" == "$panel_path" ]]; then
                 _chk_line "$OK" "XHTTP path sync" "$nginx_path  (matches in nginx + panel host)"
             else
@@ -298,11 +309,32 @@ _test_one() {
     local sni; sni="$(jq -r '.active_snis[0].sni' "${STATE_DIR}/sni.json" 2>/dev/null)"
     [[ -z "$sni" || "$sni" == "null" ]] && { echo "  no active SNI in state"; return 1; }
 
-    # Need a real user UUID — try to fetch from panel
-    local users_resp; users_resp="$(_panel GET '/api/users?limit=1' 2>/dev/null || echo '')"
-    local user_uuid; user_uuid="$(echo "$users_resp" | jq -r '.response.users[0].uuid // .response[0].uuid // empty' 2>/dev/null)"
+    # Need a UUID that's actually granted access to this node's inbounds, i.e.
+    # a user in a squad linked to the config-profile. Random panel users may
+    # not be in that squad, in which case Reality silently drops the handshake
+    # and the test reports a misleading "connection failed".
+    #
+    # Best workflow: operator saves any working vless:// URL once at
+    # /opt/web/state/test.vless. We extract the UUID from it.
+    # Fallback: pick first user from /api/users (may not work if not in squad).
+    local user_uuid=""
+    if [[ -f "${STATE_DIR}/test.vless" ]]; then
+        local url; url="$(head -1 "${STATE_DIR}/test.vless" | sed 's/^vless:\/\///')"
+        user_uuid="${url%%@*}"
+        echo "  ${GRAY}using UUID from /opt/web/state/test.vless${RESET}"
+    fi
     if [[ -z "$user_uuid" ]]; then
-        echo "  ${YELLOW}no users in panel — create one first to enable internal protocol test${RESET}"
+        local users_resp; users_resp="$(_panel GET '/api/users?limit=1' 2>/dev/null || echo '')"
+        user_uuid="$(echo "$users_resp" | jq -r '
+            (if (.response | type) == "array" then .response
+             elif (.response.users | type) == "array" then .response.users
+             else [] end)
+            | .[0].uuid // empty
+        ' 2>/dev/null)"
+    fi
+    if [[ -z "$user_uuid" ]]; then
+        echo "  ${YELLOW}no usable test UUID. Save a working vless:// URL to ${STATE_DIR}/test.vless:${RESET}"
+        echo "    echo 'vless://your-uuid@...' > ${STATE_DIR}/test.vless"
         return 1
     fi
 
@@ -311,11 +343,11 @@ _test_one() {
         reality)
             cat > "${cfg_dir}/c.json" <<JSON
 {
-  "log":{"loglevel":"warning"},
+  "log":{"loglevel":"info"},
   "inbounds":[{"port":21080,"protocol":"socks","settings":{"udp":true,"auth":"noauth"}}],
   "outbounds":[{
     "protocol":"vless",
-    "settings":{"vnext":[{"address":"${NODE_PUBLIC_IP}","port":443,"users":[{"id":"${user_uuid}","encryption":"none","flow":"xtls-rprx-vision"}]}]},
+    "settings":{"vnext":[{"address":"${NODE_PUBLIC_IP}","port":443,"users":[{"id":"${user_uuid}","encryption":"none"}]}]},
     "streamSettings":{
       "network":"raw","security":"reality",
       "realitySettings":{"serverName":"${sni}","fingerprint":"chrome","publicKey":"${REALITY_PUB_TCP}","shortId":"${SHORT_ID_TCP}","spiderX":""}
@@ -327,7 +359,7 @@ JSON
         grpc)
             cat > "${cfg_dir}/c.json" <<JSON
 {
-  "log":{"loglevel":"warning"},
+  "log":{"loglevel":"info"},
   "inbounds":[{"port":21080,"protocol":"socks","settings":{"udp":true,"auth":"noauth"}}],
   "outbounds":[{
     "protocol":"vless",
@@ -344,7 +376,7 @@ JSON
         xhttp)
             cat > "${cfg_dir}/c.json" <<JSON
 {
-  "log":{"loglevel":"warning"},
+  "log":{"loglevel":"info"},
   "inbounds":[{"port":21080,"protocol":"socks","settings":{"udp":true,"auth":"noauth"}}],
   "outbounds":[{
     "protocol":"vless",
@@ -372,7 +404,7 @@ JSON
     sleep 5
 
     local exit_ip
-    exit_ip="$(curl -s --max-time 20 --socks5-hostname 127.0.0.1:21080 https://api.ipify.org 2>/dev/null || echo '')"
+    exit_ip="$(curl -s --max-time 30 --socks5-hostname 127.0.0.1:21080 https://api.ipify.org 2>/dev/null || echo '')"
 
     # If failure, capture xray client logs BEFORE removing the container so we
     # can show the operator what went wrong (handshake refused, no user, etc.)

@@ -1768,7 +1768,9 @@ _xhttp_extra_json() {
   },
   "noGRPCHeader": false,
   "xPaddingBytes": "100-1000",
-  "scMaxEachPostBytes": "393216-786432"
+  "scMaxEachPostBytes": "393216-786432",
+  "xPaddingKey": "v",
+  "xPaddingPlacement": "query"
 }
 JSON
 }

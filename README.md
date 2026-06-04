@@ -177,6 +177,33 @@ nstp uninstall   # или bash node-bootstrap.sh --uninstall
 
 ---
 
+## Известные upstream-баги
+
+### XHTTP: `?x_padding=` в `Referer` ловят некоторые WAF
+
+В текущих версиях Xray (≤ 26.3.27) клиент XHTTP **жёстко** шлёт в каждый запрос:
+
+```
+Referer: https://<host>/<path>/?x_padding=<random>
+```
+
+Эта подпись попала в правила некоторых российских CDN-WAF (CDNvideo / CDNetworks RU / Beeline CDN edge) — они отдают `403 HIT` ещё на edge, до origin. Подробности и репродьюс: [XTLS/Xray-core#6263](https://github.com/XTLS/Xray-core/issues/6263) (closed: NOT_PLANNED).
+
+**Когда касается нас:**
+- ✅ Не касается, если трафик клиента идёт напрямую к нашему европейскому IP — никакого RU CDN на пути
+- ⚠️ Касается, если ISP клиента роутит через CDNvideo/Beeline edge (зависит от провайдера и региона)
+
+**Что сделано в скрипте на пробу:**
+В XHTTP `extra` добавлены `xPaddingKey: "v"` и `xPaddingPlacement: "query"` — в текущем Xray игнорируется, но потенциально начнёт работать в будущих версиях ядра (по намёку маинтейнера).
+
+**Если у конкретного юзера XHTTP не идёт:**
+- Reality TCP / gRPC остаются основными — они работают
+- Hysteria2 — UDP-альтернатива
+
+XHTTP в подписке — как дополнительный fallback, не как основной транспорт.
+
+---
+
 ## English
 
 (coming — see Russian section above for full reference)

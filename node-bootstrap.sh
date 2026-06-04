@@ -1289,16 +1289,11 @@ server {
     access_log /var/log/nginx/access.log pp;
     error_log  /var/log/nginx/error.log warn;
 
+    # Standard security headers — safe to apply server-wide; gRPC clients
+    # don't look at these.
     add_header X-Frame-Options "SAMEORIGIN" always;
     add_header X-Content-Type-Options "nosniff" always;
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
-    # Cloudflare-style response headers — DPI grep-detection that triggers
-    # on "Server: nginx + no CF-RAY" gets confused. The Alt-Svc tells the
-    # client HTTP/3 is available on :443 — same as every real CDN site.
-    add_header Alt-Svc 'h3=":443"; ma=86400' always;
-    set \$cf_ray \$request_id\$msec;
-    add_header CF-Cache-Status DYNAMIC always;
-    add_header CF-RAY "\$cf_ray" always;
 
     # Fake static assets that the stub HTML references. Real sites serve
     # CSS/JS bundles from CDN; if the stub returns 404 for /static/*.js
@@ -1316,6 +1311,12 @@ server {
         return 200 "/* */\n:root{--bg:#0d1117}body{margin:0}\n";
     }
 
+    # XHTTP grpc_pass — DELIBERATELY no CDN-mimicry response headers here.
+    # Server-level `add_header Alt-Svc h3=":443"` propagated into XHTTP
+    # responses and caused Xray clients to attempt h3/QUIC upgrade against
+    # a server that doesn't speak QUIC. Result: connection stalls or
+    # silently breaks on PL/US deployments (NL was set up before this and
+    # is unaffected). Keeping this location clean fixes that regression.
     location ${XHTTP_PATH} {
         client_max_body_size 0;
         grpc_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
@@ -1325,7 +1326,14 @@ server {
         grpc_pass unix:${XHTTP_SOCK};
     }
 
+    # CDN-mimicry response headers go HERE only (on the stub HTML page),
+    # so an active TLS probe sees a CF-looking site without those headers
+    # leaking into XHTTP responses where they trigger client-side bugs.
     location / {
+        set \$cf_ray \$request_id\$msec;
+        add_header Alt-Svc 'h3=":443"; ma=86400' always;
+        add_header CF-Cache-Status DYNAMIC always;
+        add_header CF-RAY "\$cf_ray" always;
         try_files \$uri \$uri/ /index.html;
     }
 }

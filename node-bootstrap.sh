@@ -1803,13 +1803,25 @@ setup_initial_hosts() {
     xhttp_extra="$(_xhttp_extra_json)"
     sockopt_params="$(_sockopt_params_json)"
 
-    # Helper to truncate remark to 40 chars
+    # Helper to build remark within the panel's 40-char limit.
+    #
+    # The panel counts string length using JavaScript String.length (UTF-16
+    # code units), where a regional-indicator flag emoji like 🇺🇸 is 4 units.
+    # Bash ${#s} in a UTF-8 locale counts it as 2 code points instead. So a
+    # remark that bash sees as 40 chars can end up as 42 in the panel's
+    # validation — exactly what failed on US-01-AKILE with the full
+    # "United States" country name.
+    #
+    # Resolution: use the 2-letter country code instead of the full name.
+    # Bash conservatively budgets 32 chars to leave ~8 unit safety margin
+    # for emoji UTF-16 expansion + any future panel change.
     _remark() {
         local prefix="$1" suffix="$2"
-        local s="[${NODE_NAME}] ${flag} ${cname} · ${suffix}"
-        if (( ${#s} > 40 )); then s="[${NODE_NAME}] ${flag} · ${suffix}"; fi
-        if (( ${#s} > 40 )); then s="[${NODE_NAME}] · ${suffix}"; fi
-        echo "${s:0:40}"
+        local s="[${NODE_NAME}] ${flag} ${COUNTRY_CODE} · ${suffix}"
+        if (( ${#s} > 32 )); then s="[${NODE_NAME}] ${flag} · ${suffix}"; fi
+        if (( ${#s} > 32 )); then s="[${NODE_NAME}] · ${suffix}"; fi
+        if (( ${#s} > 32 )); then s="${NODE_NAME} · ${suffix}"; fi
+        echo "${s:0:32}"
     }
 
     # ─── Reality TCP — securityLayer=DEFAULT (panel reads Reality from inbound)

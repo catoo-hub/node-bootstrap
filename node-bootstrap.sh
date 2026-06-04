@@ -1386,8 +1386,14 @@ services:
         max-file: "3"
 EOF
 
-    log_info "Starting nginx container..."
-    ( cd "$NGINX_DIR" && docker compose up -d 2>&1 | sed 's/^/    [nginx] /' ) || {
+    log_info "Starting nginx container (forcing recreate so new config files are reloaded)..."
+    # `docker compose up -d` alone won't restart an already-running container
+    # when only bind-mounted files changed — nginx keeps running with the
+    # old config in process memory. On a re-install where XHTTP_PATH was
+    # re-randomised, that leads to a 405 mismatch between nginx (old path)
+    # and the panel host record (new path). Force-recreate guarantees the
+    # nginx process re-reads ./conf.d on every install.
+    ( cd "$NGINX_DIR" && docker compose up -d --force-recreate 2>&1 | sed 's/^/    [nginx] /' ) || {
         log_error "Nginx failed to start"
         STEP_STATUS["nginx"]="FAILED"
         return 1
@@ -1966,8 +1972,12 @@ services:
         max-file: "5"
 EOF
 
-    log_info "Starting node container..."
-    ( cd "$NODE_DIR" && docker compose up -d 2>&1 | sed 's/^/    [node] /' ) || {
+    log_info "Starting node container (force-recreate so env_file changes take effect)..."
+    # `up -d` alone would skip restarting a running container even though the
+    # .env file (SECRET_KEY, NODE_PORT) was just rewritten — Docker compares
+    # the compose spec, not bind-mounted file contents. Force-recreate so the
+    # node container actually picks up any rotated panel pubKey or port.
+    ( cd "$NODE_DIR" && docker compose up -d --force-recreate 2>&1 | sed 's/^/    [node] /' ) || {
         log_error "Node failed to start"
         STEP_STATUS["node"]="FAILED"
         return 1

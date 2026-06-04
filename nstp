@@ -367,12 +367,28 @@ _test_one() {
     # /opt/web/state/test.vless. We extract the UUID from it.
     # Fallback: pick first user from /api/users (may not work if not in squad).
     local user_uuid=""
+    local uuid_source=""
     if [[ -f "${STATE_DIR}/test.vless" ]]; then
         local url; url="$(head -1 "${STATE_DIR}/test.vless" | sed 's/^vless:\/\///')"
         user_uuid="${url%%@*}"
-        echo "  ${GRAY}using UUID from /opt/web/state/test.vless${RESET}"
+        uuid_source="test.vless"
     fi
     if [[ -z "$user_uuid" ]]; then
+        echo ""
+        echo "  ${YELLOW}⚠  No /opt/web/state/test.vless found.${RESET}"
+        echo ""
+        echo "  Falling back to /api/users?limit=1 — this picks a RANDOM panel user"
+        echo "  who is probably ${BOLD}not${RESET} in a squad that has access to this node's inbounds."
+        echo "  Reality VLESS will silently drop the handshake → test reports"
+        echo "  ${RED}'connection failed'${RESET} even though server is fine."
+        echo ""
+        echo "  ${GREEN}To get a meaningful test result:${RESET}"
+        echo "    1. In panel UI, open any user that's in a squad linked to this node"
+        echo "    2. Copy their Reality TCP vless:// URL"
+        echo "    3. Save it on this server:"
+        echo "       ${CYAN}echo 'vless://<UUID>@...' > ${STATE_DIR}/test.vless${RESET}"
+        echo "    4. Re-run ${CYAN}nstp test${RESET}"
+        echo ""
         local users_resp; users_resp="$(_panel GET '/api/users?limit=1' 2>/dev/null || echo '')"
         user_uuid="$(echo "$users_resp" | jq -r '
             (if (.response | type) == "array" then .response
@@ -380,12 +396,13 @@ _test_one() {
              else [] end)
             | .[0].uuid // empty
         ' 2>/dev/null)"
+        uuid_source="random (unsafe)"
     fi
     if [[ -z "$user_uuid" ]]; then
-        echo "  ${YELLOW}no usable test UUID. Save a working vless:// URL to ${STATE_DIR}/test.vless:${RESET}"
-        echo "    echo 'vless://your-uuid@...' > ${STATE_DIR}/test.vless"
+        echo "  ${RED}no usable test UUID and panel has no users. Aborting.${RESET}"
         return 1
     fi
+    echo "  ${GRAY}UUID source: ${uuid_source}${RESET}"
 
     local cfg_dir; cfg_dir="$(mktemp -d)"
     case "$proto" in

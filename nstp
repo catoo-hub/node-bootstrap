@@ -9,6 +9,7 @@
 #    test [reality|grpc|xhttp|all]  internal protocol probe via Docker Xray client
 #    logs [node|nginx|all]
 #    cert {status|renew}
+#    wg   {status|client|xray}
 #    sni  {list|rotate|rotate-now}
 #    fp   {show|set <fp>}
 #    update                       docker compose pull + up -d
@@ -96,6 +97,18 @@ cmd_status() {
     else
         echo "  (not initialized — run 'web-sni-rotate init' or re-install)"
     fi
+    echo ""
+    echo -e "${BOLD}WireGuard:${RESET}"
+    if [[ "${WITH_WG_SERVER:-false}" == true ]]; then
+        if command -v wg &>/dev/null && wg show "${WG_IFACE:-wg-web}" &>/dev/null; then
+            echo "  ${WG_IFACE:-wg-web} ${WG_SERVER_ADDR:-10.66.66.1/24} udp/${WG_PORT:-51820}"
+            wg show "${WG_IFACE:-wg-web}" | sed 's/^/    /'
+        else
+            echo "  configured, but interface is not up"
+        fi
+    else
+        echo "  disabled"
+    fi
 }
 
 cmd_logs() {
@@ -115,6 +128,35 @@ cmd_cert() {
         status) openssl x509 -in "${NGINX_DIR}/ssl/fullchain.pem" -text -noout | grep -E "Subject:|DNS:|Not After" ;;
         renew)  [[ -x /usr/local/bin/web-cert-renew ]] && /usr/local/bin/web-cert-renew || echo "renewer missing" ;;
         *) echo "Usage: nstp cert {status|renew}"; exit 2 ;;
+    esac
+}
+
+cmd_wg() {
+    case "${1:-status}" in
+        status)
+            if [[ "${WITH_WG_SERVER:-false}" != true ]]; then
+                echo "WireGuard server is disabled for this node."
+                return 0
+            fi
+            echo "Interface : ${WG_IFACE:-wg-web}"
+            echo "Listen    : udp/${WG_PORT:-51820}"
+            echo "Server IP : ${WG_SERVER_ADDR:-10.66.66.1/24}"
+            echo "Client IP : ${WG_CLIENT_ADDR:-10.66.66.2/32}"
+            echo "Allow from: ${WG_ALLOWED_SOURCE:-any}"
+            echo ""
+            wg show "${WG_IFACE:-wg-web}" 2>/dev/null || echo "wg interface is not up"
+            ;;
+        client)
+            [[ -f "${STATE_DIR}/wg-client.conf" ]] || { echo "missing ${STATE_DIR}/wg-client.conf"; exit 1; }
+            sed 's/^/  /' "${STATE_DIR}/wg-client.conf"
+            ;;
+        xray)
+            [[ -f "${STATE_DIR}/xray-wireguard-outbound.json" ]] || { echo "missing ${STATE_DIR}/xray-wireguard-outbound.json"; exit 1; }
+            cat "${STATE_DIR}/xray-wireguard-outbound.json"
+            echo ""
+            [[ -f "${STATE_DIR}/xray-dialerproxy-example.json" ]] && cat "${STATE_DIR}/xray-dialerproxy-example.json"
+            ;;
+        *) echo "Usage: nstp wg {status|client|xray}"; exit 2 ;;
     esac
 }
 
@@ -566,7 +608,7 @@ cmd_menu() {
         echo "  ${CYAN}1)${RESET} status        ${CYAN}5)${RESET} sni list         ${CYAN}9)${RESET} diag (auto-diagnose)"
         echo "  ${CYAN}2)${RESET} logs all      ${CYAN}6)${RESET} sni rotate-now   ${CYAN}t)${RESET} test all protocols"
         echo "  ${CYAN}3)${RESET} cert status   ${CYAN}7)${RESET} update images    ${RED}u)${RESET} uninstall"
-        echo "  ${CYAN}4)${RESET} cert renew    ${CYAN}8)${RESET} fingerprint"
+        echo "  ${CYAN}4)${RESET} cert renew    ${CYAN}8)${RESET} fingerprint      ${CYAN}w)${RESET} wireguard"
         echo "  ${YELLOW}q)${RESET} quit"
         read -rp "  > " c
         case "$c" in
@@ -577,6 +619,7 @@ cmd_menu() {
                ;;
             9) cmd_diag ;;
             t|T) cmd_test all ;;
+            w|W) cmd_wg status ;;
             u|U) cmd_uninstall; break ;;
             q|Q|"") break ;;
         esac
@@ -587,6 +630,7 @@ case "${1:-menu}" in
     status)         cmd_status ;;
     logs)           shift; cmd_logs "$@" ;;
     cert)           shift; cmd_cert "$@" ;;
+    wg)             shift; cmd_wg "$@" ;;
     sni)            shift; cmd_sni  "$@" ;;
     fp)             shift; cmd_fp   "$@" ;;
     diag)           cmd_diag ;;
@@ -606,6 +650,7 @@ Usage:
   nstp test {reality|grpc|xhttp|all}  internal protocol probe via Xray + SOCKS
   nstp logs [node|nginx|xray|all]
   nstp cert {status|renew}
+  nstp wg   {status|client|xray}
   nstp sni  {list|rotate|rotate-now}
   nstp fp   {show|set <fp>}
   nstp update                       docker compose pull + up -d

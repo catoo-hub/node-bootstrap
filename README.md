@@ -19,6 +19,7 @@
 | **rw-node** (`ghcr.io/remnawave/node:latest`) | нейтральное имя `web-node` в `/opt/web/node`, `network_mode: host` |
 | **4 inbounds** | Reality TCP `:443`, Reality gRPC `:8443`, VLESS-XHTTP через unix-socket, Hysteria2 `:9443/udp` — всё в одной config-profile в панели |
 | **3×3 SNI-ротатор** | каждые 3 дня обновляет `serverNames` в обоих Reality inbound'ах + создаёт 2 свежих host (TCP+gRPC), удаляет 2 самых старых |
+| **WireGuard server** | опционально: `wg-web` на ноде для BS `wg-relay` и Xray `dialerProxy` |
 | **`nstp` CLI** | `/usr/local/bin/nstp` — status, logs, cert, sni list/rotate, fp, update, uninstall |
 
 ### Архитектура соединения
@@ -39,6 +40,27 @@ client → :9443 UDP      (rw-node Xray Hysteria2, TLS с тем же wildcard c
 ```
 
 Default-server в nginx с `ssl_reject_handshake on` бесшумно дропает запросы с неизвестным SNI — селфстил выглядит как одиночный сайт.
+
+### Опциональный WG-layer для BS relay
+
+Если нужно тестировать схему, где BS принимает только WireGuard UDP и пробрасывает его на ноду через `server-bootstrap --mode wg-relay`, включите WG-сервер на ноде:
+
+```
+client → BS_RELAY_IP:51820/udp → IPVS/nft relay → NODE_IP:51820/udp
+                                             ↓
+                                      wg-web на ноде
+                                             ↓
+                          Xray Reality по внутреннему адресу 10.66.66.1:443
+```
+
+Для этого нода создаёт:
+- WireGuard interface `wg-web` с адресом `10.66.66.1/24`
+- клиентский peer `10.66.66.2/32`
+- `/opt/web/state/wg-client.conf`
+- `/opt/web/state/xray-wireguard-outbound.json`
+- `/opt/web/state/xray-dialerproxy-example.json`
+
+В panel/client-конфиге VLESS-outbound должен ходить не на публичный IP ноды, а на внутренний WG-адрес `10.66.66.1:443`, а `sockopt.dialerProxy` должен ссылаться на `wg-out`. Для такого клиента публичная точка входа — BS relay UDP; обычные public-порты ноды пока остаются включены как в стандартной установке.
 
 ### Стратегия защиты от блокировок SNI
 
@@ -105,6 +127,12 @@ sudo bash node-bootstrap.sh \
 | `--active-snis <n>` | `3` | сколько SNI держать живыми |
 | `--sni-style` | `cdn` | `cdn` \| `words` \| `hex` |
 | `--fp` | `randomized` | default Xray fingerprint |
+| `--with-wg-server` | off | поставить WireGuard server на ноду |
+| `--wg-port <p>` | `51820` | UDP-порт WireGuard на ноде |
+| `--wg-iface <name>` | `wg-web` | имя WireGuard-интерфейса |
+| `--wg-server-addr <cidr>` | `10.66.66.1/24` | адрес WG-сервера на ноде |
+| `--wg-client-addr <cidr>` | `10.66.66.2/32` | адрес generated WG client |
+| `--wg-allow-from <ip>` | any | открыть WG в UFW только с IP BS relay |
 | `--dry-run` | — | симуляция |
 | `--verbose, -v` | — | debug |
 | `--non-interactive, -y` | — | без вопросов |
@@ -112,6 +140,20 @@ sudo bash node-bootstrap.sh \
 **Fallback на существующую ноду** (если уже создана в UI):
 ```bash
 sudo bash node-bootstrap.sh ... --existing-node --existing-node-uuid <uuid> --node-key <SECRET_KEY>
+```
+
+**Нода для BS `wg-relay`:**
+```bash
+sudo bash node-bootstrap.sh \
+    --domain example.com \
+    --cf-token cf_xxx \
+    --panel-url https://panel.example.com \
+    --panel-token rw_xxx \
+    --country RU \
+    --hosting 1CENT \
+    --with-wg-server \
+    --wg-allow-from <BS_RELAY_IP> \
+    --non-interactive
 ```
 
 ### Управление после установки
@@ -125,6 +167,9 @@ nstp sni rotate-now     # форс-ротация прямо сейчас
 nstp cert status        # сроки сертификата
 nstp cert renew         # форс-renew
 nstp fp set chrome      # сменить default FP (новые хосты получат)
+nstp wg status          # WireGuard server status
+nstp wg client          # generated wg-client.conf
+nstp wg xray            # Xray wireguard outbound + dialerProxy пример
 nstp update             # docker compose pull + up -d
 nstp uninstall          # снести всё (с подтверждением)
 ```
@@ -147,9 +192,13 @@ nstp uninstall          # снести всё (с подтверждением)
     ├── config.env              — параметры установки
     ├── secrets.env             — токены (CF, Panel, Node KEY)
     ├── sni.json                — текущие 3 активных SNI + UUID хостов + static_hosts
+    ├── wg-client.conf          — optional WireGuard client config для BS/Xray
+    ├── xray-wireguard-outbound.json
+    ├── xray-dialerproxy-example.json
     └── version
 
 /etc/nginx/ssl/node.<DOMAIN>/   — симлинк → /opt/web/nginx/ssl/  (для Hysteria2 совместимости)
+/etc/wireguard/wg-web.conf      — optional WireGuard server config
 /etc/cron.d/web-sni-rotate      — крон ежедневно в 04:xx
 /usr/local/bin/nstp             — CLI
 /usr/local/bin/web-sni-rotate   — ротатор

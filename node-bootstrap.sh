@@ -21,7 +21,7 @@ IFS=$'\n\t'
 
 readonly SCRIPT_VERSION="1.1.0"
 readonly SCRIPT_NAME="$(basename "$0")"
-readonly LOG_FILE="/var/log/node-bootstrap.log"
+LOG_FILE="/var/log/node-bootstrap.log"
 readonly STATE_DIR="/opt/web/state"
 readonly CONFIG_FILE="${STATE_DIR}/config.env"
 readonly VERSION_FILE="${STATE_DIR}/version"
@@ -56,6 +56,16 @@ SKIP_UPDATE=false
 UNINSTALL=false
 WITH_MONITORING=false
 MONITOR_FROM_IP=""         # IP of the panel/Prometheus server allowed to scrape :9100
+WITH_WG_SERVER=false       # Optional WireGuard server for BS wg-relay / Xray dialerProxy
+WG_IFACE="wg-web"
+WG_PORT="51820"
+WG_SERVER_ADDR="10.66.66.1/24"
+WG_CLIENT_ADDR="10.66.66.2/32"
+WG_ALLOWED_SOURCE=""       # Optional BS relay IP allowed in UFW; empty = allow any source
+WG_SERVER_PRIV=""
+WG_SERVER_PUB=""
+WG_CLIENT_PRIV=""
+WG_CLIENT_PUB=""
 
 # Required params
 DOMAIN=""                  # example.com — wildcard base
@@ -469,6 +479,15 @@ SHORT_ID_GRPC="${SHORT_ID_GRPC}"
 HYS_PASSWORD="${HYS_PASSWORD}"
 HYS_OBFS_PASSWORD="${HYS_OBFS_PASSWORD}"
 STUB_NAME="${STUB_NAME}"
+
+WITH_WG_SERVER="${WITH_WG_SERVER}"
+WG_IFACE="${WG_IFACE}"
+WG_PORT="${WG_PORT}"
+WG_SERVER_ADDR="${WG_SERVER_ADDR}"
+WG_CLIENT_ADDR="${WG_CLIENT_ADDR}"
+WG_ALLOWED_SOURCE="${WG_ALLOWED_SOURCE}"
+WG_SERVER_PUB="${WG_SERVER_PUB}"
+WG_CLIENT_PUB="${WG_CLIENT_PUB}"
 EOF
     chmod 600 "$CONFIG_FILE"
 
@@ -476,6 +495,8 @@ EOF
 CF_TOKEN="${CF_TOKEN}"
 PANEL_API_TOKEN="${PANEL_API_TOKEN}"
 NODE_SECRET_KEY="${NODE_SECRET_KEY}"
+WG_SERVER_PRIV="${WG_SERVER_PRIV}"
+WG_CLIENT_PRIV="${WG_CLIENT_PRIV}"
 EOF
     chmod 600 "${STATE_DIR}/secrets.env"
 
@@ -560,6 +581,13 @@ panel_create_host() {
 collect_params() {
     log_step "Collecting installation parameters"
 
+    local cli_with_wg_server="$WITH_WG_SERVER"
+    local cli_wg_port="$WG_PORT"
+    local cli_wg_iface="$WG_IFACE"
+    local cli_wg_server_addr="$WG_SERVER_ADDR"
+    local cli_wg_client_addr="$WG_CLIENT_ADDR"
+    local cli_wg_allowed_source="$WG_ALLOWED_SOURCE"
+
     # 0. Resume previous values from state if present. CLI flags override these;
     #    only fields the operator didn't pass get the persisted value. Critical
     #    for re-runs — keeps XHTTP_PATH / SHORT_ID_* / Reality keys / passwords
@@ -567,6 +595,13 @@ collect_params() {
     if state_load 2>/dev/null; then
         log_info "Loaded previous install state from ${CONFIG_FILE}"
     fi
+
+    [[ "$cli_with_wg_server" == true ]] && WITH_WG_SERVER=true
+    [[ "$cli_wg_port" != "51820" ]] && WG_PORT="$cli_wg_port"
+    [[ "$cli_wg_iface" != "wg-web" ]] && WG_IFACE="$cli_wg_iface"
+    [[ "$cli_wg_server_addr" != "10.66.66.1/24" ]] && WG_SERVER_ADDR="$cli_wg_server_addr"
+    [[ "$cli_wg_client_addr" != "10.66.66.2/32" ]] && WG_CLIENT_ADDR="$cli_wg_client_addr"
+    [[ -n "$cli_wg_allowed_source" ]] && WG_ALLOWED_SOURCE="$cli_wg_allowed_source"
 
     # 1. DOMAIN
     if [[ -z "$DOMAIN" ]]; then
@@ -794,6 +829,143 @@ setup_ufw() {
     ufw --force enable &>/dev/null
     log_ok "UFW enabled (ssh:${sp}, 80, 443, 8443, 9443/udp, ${NODE_PORT})"
     STEP_STATUS["ufw"]="OK"
+}
+
+_wg_pubkey() {
+    local priv="$1"
+    printf '%s\n' "$priv" | wg pubkey
+}
+
+setup_wireguard_server() {
+    [[ "$WITH_WG_SERVER" == true ]] || { STEP_STATUS["wireguard"]="SKIPPED"; return 0; }
+
+    log_step "Configuring WireGuard server (${WG_IFACE})"
+
+    if ! [[ "$WG_PORT" =~ ^[0-9]+$ ]]; then
+        log_error "--wg-port must be numeric, got: ${WG_PORT}"
+        STEP_STATUS["wireguard"]="FAILED"
+        return 1
+    fi
+
+    if [[ "$WG_IFACE" == *[^a-zA-Z0-9_.-]* || ${#WG_IFACE} -gt 15 ]]; then
+        log_error "--wg-iface must be <=15 chars and contain only letters, digits, dot, underscore or dash"
+        STEP_STATUS["wireguard"]="FAILED"
+        return 1
+    fi
+
+    install_packages wireguard-tools
+
+    if [[ "$DRY_RUN" == true ]]; then
+        log_dry "Would configure WireGuard ${WG_IFACE} on UDP ${WG_PORT}"
+        STEP_STATUS["wireguard"]="DRY"
+        return 0
+    fi
+
+    if [[ -z "$WG_SERVER_PRIV" ]]; then
+        WG_SERVER_PRIV="$(wg genkey)"
+        WG_SERVER_PUB="$(_wg_pubkey "$WG_SERVER_PRIV")"
+    fi
+    if [[ -z "$WG_CLIENT_PRIV" ]]; then
+        WG_CLIENT_PRIV="$(wg genkey)"
+        WG_CLIENT_PUB="$(_wg_pubkey "$WG_CLIENT_PRIV")"
+    fi
+    [[ -z "$WG_SERVER_PUB" ]] && WG_SERVER_PUB="$(_wg_pubkey "$WG_SERVER_PRIV")"
+    [[ -z "$WG_CLIENT_PUB" ]] && WG_CLIENT_PUB="$(_wg_pubkey "$WG_CLIENT_PRIV")"
+
+    mkdir -p /etc/wireguard "$STATE_DIR"
+    chmod 700 /etc/wireguard
+
+    local server_ip="${WG_SERVER_ADDR%%/*}"
+    local client_ip="${WG_CLIENT_ADDR%%/*}"
+    local conf="/etc/wireguard/${WG_IFACE}.conf"
+
+    backup_file "$conf"
+    cat > "$conf" <<EOF
+[Interface]
+Address = ${WG_SERVER_ADDR}
+ListenPort = ${WG_PORT}
+PrivateKey = ${WG_SERVER_PRIV}
+SaveConfig = false
+
+[Peer]
+PublicKey = ${WG_CLIENT_PUB}
+AllowedIPs = ${WG_CLIENT_ADDR}
+EOF
+    chmod 600 "$conf"
+
+    systemctl enable --now "wg-quick@${WG_IFACE}" &>/dev/null || {
+        log_error "Failed to start wg-quick@${WG_IFACE}"
+        journalctl -u "wg-quick@${WG_IFACE}" -n 30 --no-pager 2>/dev/null | sed 's/^/    [wg] /' >&2 || true
+        STEP_STATUS["wireguard"]="FAILED"
+        return 1
+    }
+
+    if command -v ufw &>/dev/null && [[ "$IS_CONTAINER" != true ]]; then
+        if [[ -n "$WG_ALLOWED_SOURCE" ]]; then
+            ufw allow from "$WG_ALLOWED_SOURCE" to any port "$WG_PORT" proto udp comment 'WireGuard from BS relay' &>/dev/null || true
+            log_info "UFW: allowed WireGuard UDP ${WG_PORT} from ${WG_ALLOWED_SOURCE}"
+        else
+            ufw allow "${WG_PORT}/udp" comment 'WireGuard server' &>/dev/null || true
+            log_info "UFW: allowed WireGuard UDP ${WG_PORT} from any source"
+        fi
+    fi
+
+    cat > "${STATE_DIR}/wg-client.conf" <<EOF
+[Interface]
+PrivateKey = ${WG_CLIENT_PRIV}
+Address = ${WG_CLIENT_ADDR}
+
+[Peer]
+PublicKey = ${WG_SERVER_PUB}
+AllowedIPs = ${server_ip}/32
+Endpoint = BS_RELAY_IP:${WG_PORT}
+PersistentKeepalive = 25
+EOF
+    chmod 600 "${STATE_DIR}/wg-client.conf"
+
+    cat > "${STATE_DIR}/xray-wireguard-outbound.json" <<EOF
+{
+  "tag": "wg-out",
+  "protocol": "wireguard",
+  "settings": {
+    "secretKey": "${WG_CLIENT_PRIV}",
+    "address": ["${WG_CLIENT_ADDR}"],
+    "peers": [
+      {
+        "publicKey": "${WG_SERVER_PUB}",
+        "endpoint": "BS_RELAY_IP:${WG_PORT}",
+        "allowedIPs": ["${server_ip}/32"],
+        "keepAlive": 25
+      }
+    ],
+    "mtu": 1420,
+    "domainStrategy": "ForceIP"
+  }
+}
+EOF
+    chmod 600 "${STATE_DIR}/xray-wireguard-outbound.json"
+
+    cat > "${STATE_DIR}/xray-dialerproxy-example.json" <<EOF
+{
+  "note": "Use wg-out as dialerProxy for the VLESS/Reality outbound. Replace VLESS fields with your subscription values.",
+  "vlessAddress": "${server_ip}",
+  "vlessPort": 443,
+  "streamSettingsSockopt": {
+    "dialerProxy": "wg-out"
+  }
+}
+EOF
+    chmod 600 "${STATE_DIR}/xray-dialerproxy-example.json"
+
+    if wg show "$WG_IFACE" &>/dev/null; then
+        log_ok "WireGuard server running: ${WG_IFACE} ${server_ip}:${WG_PORT}/udp (client ${client_ip})"
+        log_info "Client templates: ${STATE_DIR}/wg-client.conf and ${STATE_DIR}/xray-wireguard-outbound.json"
+        STEP_STATUS["wireguard"]="OK"
+    else
+        log_error "WireGuard interface ${WG_IFACE} is not visible after start"
+        STEP_STATUS["wireguard"]="FAILED"
+        return 1
+    fi
 }
 
 setup_fail2ban() {
@@ -2090,6 +2262,11 @@ print_summary() {
     echo -e "  ${BOLD}Node:${RESET}      ${NODE_NAME} $(country_flag "$COUNTRY_CODE") $(country_name "$COUNTRY_CODE")"
     echo -e "  ${BOLD}Panel UUID:${RESET} ${NODE_UUID}"
     echo -e "  ${BOLD}Profile:${RESET}    ${CONFIG_PROFILE_UUID}"
+    if [[ "$WITH_WG_SERVER" == true ]]; then
+        echo -e "  ${BOLD}WireGuard:${RESET} ${WG_IFACE} ${WG_SERVER_ADDR} udp/${WG_PORT}"
+        echo -e "  ${BOLD}WG client:${RESET} ${STATE_DIR}/wg-client.conf"
+        echo -e "  ${BOLD}Xray WG:${RESET}   ${STATE_DIR}/xray-wireguard-outbound.json"
+    fi
     echo ""
     echo -e "  ${BOLD}Next:${RESET}"
     echo "    • ${BOLD}nstp status${RESET}      — verify everything green"
@@ -2109,6 +2286,10 @@ run_uninstall() {
     [[ "$ans" != "yes" ]] && { log_info "Aborted"; return 0; }
     [[ -f "${NODE_DIR}/docker-compose.yml"  ]] && ( cd "$NODE_DIR"  && docker compose down --volumes 2>/dev/null || true )
     [[ -f "${NGINX_DIR}/docker-compose.yml" ]] && ( cd "$NGINX_DIR" && docker compose down --volumes 2>/dev/null || true )
+    if [[ -n "${WG_IFACE:-}" ]]; then
+        systemctl disable --now "wg-quick@${WG_IFACE}" 2>/dev/null || true
+        rm -f "/etc/wireguard/${WG_IFACE}.conf"
+    fi
     rm -rf /opt/web /etc/nginx/ssl/node.*
     rm -f "$NSTP_BIN" "$SNI_ROTATE_BIN" "$CERT_RENEW_BIN"
     rm -f /etc/cron.d/web-sni-rotate
@@ -2143,6 +2324,12 @@ ${BOLD}Optional:${RESET}
   --active-snis <n>       active SNIs in rotation pool (default: ${ACTIVE_SNIS})
   --sni-style <s>         cdn | words | hex (default: ${SNI_STYLE})
   --fp <fp>               default fingerprint (default: ${DEFAULT_FP})
+  --with-wg-server        install WireGuard server for BS wg-relay / Xray dialerProxy
+  --wg-port <p>           WireGuard UDP port on this node (default: ${WG_PORT})
+  --wg-iface <name>       WireGuard interface name (default: ${WG_IFACE})
+  --wg-server-addr <cidr> WireGuard server address (default: ${WG_SERVER_ADDR})
+  --wg-client-addr <cidr> WireGuard generated client address (default: ${WG_CLIENT_ADDR})
+  --wg-allow-from <ip>    only allow WireGuard UDP from this BS relay IP in UFW
   --dry-run               simulate
   --verbose, -v           debug output
   --skip-update           skip apt update
@@ -2166,6 +2353,11 @@ ${BOLD}Examples:${RESET}
   bash ${SCRIPT_NAME} --domain example.com --cf-token cf_xxx \\
       --panel-url https://panel.example.com --panel-token rw_xxx \\
       --existing-node --existing-node-uuid <uuid> --node-key <KEY> -y
+
+  # Optional WireGuard server for BS wg-relay:
+  bash ${SCRIPT_NAME} --domain node.example.com --cf-token cf_xxx \\
+      --panel-url https://panel.example.com --panel-token rw_xxx \\
+      --country RU --hosting 1CENT --with-wg-server --wg-allow-from <BS_RELAY_IP> -y
 EOF
 }
 
@@ -2185,6 +2377,12 @@ parse_args() {
             --sni-style)            SNI_STYLE="$2";           shift 2 ;;
             --fp)                   DEFAULT_FP="$2";          shift 2 ;;
             --monitor-from)         MONITOR_FROM_IP="$2";     shift 2 ;;
+            --with-wg-server)       WITH_WG_SERVER=true;      shift ;;
+            --wg-port)              WG_PORT="$2";             shift 2 ;;
+            --wg-iface)             WG_IFACE="$2";            shift 2 ;;
+            --wg-server-addr)       WG_SERVER_ADDR="$2";      shift 2 ;;
+            --wg-client-addr)       WG_CLIENT_ADDR="$2";      shift 2 ;;
+            --wg-allow-from)        WG_ALLOWED_SOURCE="$2";   shift 2 ;;
             --existing-node)        USE_EXISTING_NODE=true;   shift ;;
             --existing-node-uuid)   EXISTING_NODE_UUID="$2";  shift 2 ;;
             --node-key)             NODE_SECRET_KEY="$2";     shift 2 ;;
@@ -2228,6 +2426,7 @@ main() {
     setup_swap
     setup_ssh
     setup_ufw
+    setup_wireguard_server
     setup_fail2ban
     install_docker
     setup_cert

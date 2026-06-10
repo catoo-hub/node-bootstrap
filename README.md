@@ -1,12 +1,65 @@
 # node-bootstrap
 
-> Production-ready installer + management CLI for a Remnawave **node** with rotating SNI, wildcard TLS via Cloudflare DNS-01, multi-protocol selfsteal (Reality TCP + gRPC + XHTTP + Hysteria2), and full API-driven setup.
+> Production-ready installer + management CLI for Remnawave node profiles: a normal multi-SNI rotating node, or a WireGuard connector node for BS wg-relay.
+
+## Install Profiles
+
+`node-bootstrap.sh` has two first-class profiles:
+
+| Profile | Use case | What it installs |
+|---|---|---|
+| `multi-sni-rotator` | Normal public node | Reality TCP, Reality gRPC, XHTTP, Hysteria2, nginx selfsteal, wildcard cert/DNS, rotating SNI hosts |
+| `wg-connector` | BS wg-relay -> WireGuard -> internal VLESS/Reality connector | WireGuard server, one VLESS/raw/Reality inbound on `10.66.66.1:9443`, Remnawave XRAY_JSON template with `wg-out`, one internal host |
+
+`multi-sni-rotator` is the default. It keeps the older behavior.
+
+`wg-connector` intentionally skips nginx, wildcard DNS, wildcard certs, XHTTP/Hysteria/gRPC extra transports, SNI rotation, cert renew helpers, and nginx fail2ban/logrotate. `nstp` reads `NODE_PROFILE` from `/opt/web/state/config.env` and hides/disables SNI/cert/fingerprint/test tools in this profile.
+
+### Normal Multi-SNI Node
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main/node-bootstrap.sh) \
+  --domain node.example.com \
+  --cf-token cf_xxx \
+  --panel-url https://panel.example.com \
+  --panel-token rw_xxx \
+  --country NL \
+  --hosting 1CENT \
+  --profile multi-sni-rotator \
+  -y
+```
+
+### WG Connector Node
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main/node-bootstrap.sh) \
+  --domain cache.example.com \
+  --cf-token cf_xxx \
+  --panel-url https://panel.example.com \
+  --panel-token rw_xxx \
+  --country RU \
+  --hosting AEZA \
+  --profile wg-connector \
+  --wg-allow-from <BS_RELAY_IP> \
+  --wg-mtu 760 \
+  -y
+```
+
+Legacy compatibility: `--wg-bridge-profile` is still accepted as an alias for `--profile wg-connector`, but new installs should use `--profile wg-connector`.
+
+For `wg-connector`, the Remnawave host should point to `10.66.66.1:9443` and use raw Reality with host `sockopt` containing:
+
+```json
+{"dialerProxy":"wg-out"}
+```
+
+The generated XRAY_JSON template contains the client-side WireGuard outbound (`wg-out`). Remnawave adds the host-generated `proxy` outbound itself.
 
 ---
 
 ## 🇷🇺 Русский
 
-`node-bootstrap.sh` (v1.1.2) поднимает Remnawave-ноду «с нуля и через API»: создаёт config-profile, регистрирует ноду в панели, генерирует Reality x25519 ключи и Hysteria пароли локально, создаёт hosts в подписках, ставит ротатор SNI и CLI `nstp`. От оператора требуются только домен Cloudflare и токены панели — никаких ручных правок в UI панели.
+`node-bootstrap.sh` (v1.1.3) поднимает Remnawave-ноду «с нуля и через API»: создаёт config-profile, регистрирует ноду в панели, генерирует Reality x25519 ключи и Hysteria пароли локально, создаёт hosts в подписках, ставит ротатор SNI и CLI `nstp`. От оператора требуются только домен Cloudflare и токены панели — никаких ручных правок в UI панели.
 
 ### Что устанавливается на сервер
 

@@ -3,7 +3,7 @@
 #  node-bootstrap.sh — Remnawave node installer (full API-driven setup)
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
 #
-#  v1.1.0 — node creation + config-profile creation + hosts creation all via API
+#  v1.1.1 — node creation + config-profile creation + hosts creation all via API
 #
 #  Usage (interactive):     bash node-bootstrap.sh
 #  Usage (non-interactive): bash node-bootstrap.sh --country NL --hosting 1CENT ... -y
@@ -19,7 +19,7 @@ IFS=$'\n\t'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.1.0"
+readonly SCRIPT_VERSION="1.1.1"
 readonly SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/node-bootstrap.log"
 readonly STATE_DIR="/opt/web/state"
@@ -918,7 +918,7 @@ Address = ${WG_CLIENT_ADDR}
 [Peer]
 PublicKey = ${WG_SERVER_PUB}
 AllowedIPs = ${server_ip}/32
-Endpoint = BS_RELAY_IP:${WG_PORT}
+Endpoint = ${WG_ALLOWED_SOURCE:-BS_RELAY_IP}:${WG_PORT}
 PersistentKeepalive = 25
 EOF
     chmod 600 "${STATE_DIR}/wg-client.conf"
@@ -933,7 +933,7 @@ EOF
     "peers": [
       {
         "publicKey": "${WG_SERVER_PUB}",
-        "endpoint": "BS_RELAY_IP:${WG_PORT}",
+        "endpoint": "${WG_ALLOWED_SOURCE:-BS_RELAY_IP}:${WG_PORT}",
         "allowedIPs": ["${server_ip}/32"],
         "keepAlive": 25
       }
@@ -944,6 +944,96 @@ EOF
 }
 EOF
     chmod 600 "${STATE_DIR}/xray-wireguard-outbound.json"
+
+    cat > "${STATE_DIR}/xray-wg-vless-client-example.json" <<EOF
+{
+  "log": {
+    "loglevel": "warning"
+  },
+  "inbounds": [
+    {
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "port": 10808,
+      "protocol": "socks",
+      "settings": {
+        "auth": "noauth",
+        "udp": true
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {
+        "vnext": [
+          {
+            "address": "${server_ip}",
+            "port": 443,
+            "users": [
+              {
+                "id": "USER_UUID_FROM_SUBSCRIPTION",
+                "encryption": "none",
+                "flow": "xtls-rprx-vision"
+              }
+            ]
+          }
+        ]
+      },
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {
+          "serverName": "CURRENT_SNI_FROM_HOST",
+          "fingerprint": "${DEFAULT_FP}",
+          "publicKey": "${REALITY_PUB_TCP}",
+          "shortId": "${SHORT_ID_TCP}",
+          "spiderX": ""
+        },
+        "sockopt": {
+          "dialerProxy": "wg-out"
+        }
+      }
+    },
+    {
+      "tag": "wg-out",
+      "protocol": "wireguard",
+      "settings": {
+        "secretKey": "${WG_CLIENT_PRIV}",
+        "address": ["${WG_CLIENT_ADDR}"],
+        "peers": [
+          {
+            "publicKey": "${WG_SERVER_PUB}",
+            "endpoint": "${WG_ALLOWED_SOURCE:-BS_RELAY_IP}:${WG_PORT}",
+            "allowedIPs": ["${server_ip}/32"],
+            "keepAlive": 25
+          }
+        ],
+        "mtu": 1420,
+        "domainStrategy": "ForceIP"
+      }
+    },
+    {
+      "tag": "direct",
+      "protocol": "freedom"
+    },
+    {
+      "tag": "block",
+      "protocol": "blackhole"
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "outboundTag": "proxy",
+        "network": "tcp,udp"
+      }
+    ]
+  }
+}
+EOF
+    chmod 600 "${STATE_DIR}/xray-wg-vless-client-example.json"
 
     cat > "${STATE_DIR}/xray-dialerproxy-example.json" <<EOF
 {
@@ -959,7 +1049,7 @@ EOF
 
     if wg show "$WG_IFACE" &>/dev/null; then
         log_ok "WireGuard server running: ${WG_IFACE} ${server_ip}:${WG_PORT}/udp (client ${client_ip})"
-        log_info "Client templates: ${STATE_DIR}/wg-client.conf and ${STATE_DIR}/xray-wireguard-outbound.json"
+        log_info "Client templates: ${STATE_DIR}/wg-client.conf, ${STATE_DIR}/xray-wireguard-outbound.json, ${STATE_DIR}/xray-wg-vless-client-example.json"
         STEP_STATUS["wireguard"]="OK"
     else
         log_error "WireGuard interface ${WG_IFACE} is not visible after start"

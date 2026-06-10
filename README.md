@@ -6,7 +6,7 @@
 
 ## 🇷🇺 Русский
 
-`node-bootstrap.sh` (v1.1.1) поднимает Remnawave-ноду «с нуля и через API»: создаёт config-profile, регистрирует ноду в панели, генерирует Reality x25519 ключи и Hysteria пароли локально, создаёт 4 hosts в подписках, ставит ротатор SNI и CLI `nstp`. От оператора требуются только домен Cloudflare и токены панели — никаких ручных правок в UI панели.
+`node-bootstrap.sh` (v1.1.2) поднимает Remnawave-ноду «с нуля и через API»: создаёт config-profile, регистрирует ноду в панели, генерирует Reality x25519 ключи и Hysteria пароли локально, создаёт hosts в подписках, ставит ротатор SNI и CLI `nstp`. От оператора требуются только домен Cloudflare и токены панели — никаких ручных правок в UI панели.
 
 ### Что устанавливается на сервер
 
@@ -46,7 +46,7 @@ Default-server в nginx с `ssl_reject_handshake on` бесшумно дропа
 Если нужно тестировать схему, где BS принимает только WireGuard UDP и пробрасывает его на ноду через `server-bootstrap --mode wg-relay`, включите WG-сервер на ноде:
 
 ```
-client → BS_RELAY_IP:51820/udp → IPVS/nft relay → NODE_IP:51820/udp
+client → BS_RELAY_IP:51820/udp → nft DNAT+SNAT relay → NODE_IP:51820/udp
                                              ↓
                                       wg-web на ноде
                                              ↓
@@ -61,7 +61,35 @@ client → BS_RELAY_IP:51820/udp → IPVS/nft relay → NODE_IP:51820/udp
 - `/opt/web/state/xray-wg-vless-client-example.json`
 - `/opt/web/state/xray-dialerproxy-example.json`
 
-Важно: WireGuard outbound относится к **клиентскому Xray config**, а не к серверному config-profile rw-node. Серверный профиль в панели всё ещё содержит Reality/XHTTP/Hysteria inbound'ы. Клиентский VLESS-outbound должен ходить не на публичный IP ноды, а на внутренний WG-адрес `10.66.66.1:443`, а `sockopt.dialerProxy` должен ссылаться на `wg-out`. Для такого клиента публичная точка входа — BS relay UDP; обычные public-порты ноды пока остаются включены как в стандартной установке.
+#### WG bridge profile
+
+Для схемы `client -> BS wg-relay UDP -> wg-web на ноде -> VLESS/raw/Reality` можно включить отдельный профиль:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main/node-bootstrap.sh) \
+  --domain cache.example.com \
+  --cf-token cf_xxx \
+  --panel-url https://panel.example.com \
+  --panel-token rw_xxx \
+  --country RU \
+  --hosting AEZA \
+  --with-wg-server \
+  --wg-bridge-profile \
+  --wg-allow-from <BS_RELAY_IP> \
+  --wg-mtu 760 \
+  -y
+```
+
+В этом режиме скрипт:
+- создаёт WireGuard server `wg-web` (`10.66.66.1/24`, client `10.66.66.2/32`, MTU `760`);
+- создаёт один server-side config-profile inbound `VLESS/raw/Reality` на `0.0.0.0:9443`;
+- создаёт XRAY_JSON subscription template с `wg-out`;
+- создаёт host с address `10.66.66.1`, port `9443`, `securityLayer: DEFAULT`, `sockoptParams: {"dialerProxy":"wg-out"}`;
+- пропускает SNI rotator, потому что bridge использует фиксированный Reality `serverNames` (`--wg-reality-sni`, default `5post-gate.x5.ru`).
+
+Дополнительные upstream exits можно передать флагами `--wg-exit-ru-*` и `--wg-exit-fin-*`. Если их не передавать, в серверном Xray config останутся только `DIRECT`, `BLOCK` и `EXIT`.
+
+Важно: WireGuard outbound относится к **клиентскому Xray config**, а не к серверному config-profile rw-node. Клиентский VLESS-outbound должен ходить не на публичный IP ноды, а на внутренний WG-адрес (`10.66.66.1:443` в стандартном примере или `10.66.66.1:9443` в WG bridge profile), а `sockopt.dialerProxy` должен ссылаться на `wg-out`. Для такого клиента публичная точка входа — BS relay UDP.
 
 ### Стратегия защиты от блокировок SNI
 

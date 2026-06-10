@@ -9,7 +9,7 @@
 | Profile | Use case | What it installs |
 |---|---|---|
 | `multi-sni-rotator` | Normal public node | Reality TCP, Reality gRPC, XHTTP, Hysteria2, nginx selfsteal, wildcard cert/DNS, rotating SNI hosts |
-| `wg-connector` | BS wg-relay -> WireGuard -> internal VLESS/Reality connector | WireGuard server, one VLESS/raw/Reality inbound on `10.66.66.1:9443`, Remnawave XRAY_JSON template with `wg-out`, one internal host |
+| `wg-connector` | WireGuard connector node for BS relay scenarios | WireGuard server, one VLESS/raw/Reality inbound on `10.66.66.1:9443`, one host. Host publication can be `client-wg` or `relay-tcp`. |
 
 `multi-sni-rotator` is the default. It keeps the older behavior.
 
@@ -47,13 +47,34 @@ bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main/
 
 Legacy compatibility: `--wg-bridge-profile` is still accepted as an alias for `--profile wg-connector`, but new installs should use `--profile wg-connector`.
 
-For `wg-connector`, the Remnawave host should point to `10.66.66.1:9443` and use raw Reality with host `sockopt` containing:
+For old client-side WG (`--wg-host-mode client-wg`, default), the Remnawave host points to `10.66.66.1:9443` and uses raw Reality with host `sockopt` containing:
 
 ```json
 {"dialerProxy":"wg-out"}
 ```
 
 The generated XRAY_JSON template contains the client-side WireGuard outbound (`wg-out`). Remnawave adds the host-generated `proxy` outbound itself.
+
+For `server-bootstrap --mode xray-wg-relay`, use relay-side TCP publication instead:
+
+```bash
+bash <(curl -Ls https://raw.githubusercontent.com/catoo-hub/node-bootstrap/main/node-bootstrap.sh) \
+  --domain cache.example.com \
+  --cf-token cf_xxx \
+  --panel-url https://panel.example.com \
+  --panel-token rw_xxx \
+  --country RU \
+  --hosting AEZA \
+  --profile wg-connector \
+  --wg-host-mode relay-tcp \
+  --wg-relay-public-address <BS_RELAY_IP_OR_DOMAIN> \
+  --wg-relay-public-port 443 \
+  --wg-allow-from <BS_RELAY_IP> \
+  --wg-mtu 760 \
+  -y
+```
+
+In `relay-tcp`, the generated Remnawave host points to the BS relay address (`<BS_RELAY_IP_OR_DOMAIN>:443`) and does not attach the XRAY_JSON `wg-out` template. The BS then forwards TCP to the gate over kernel WireGuard.
 
 ---
 

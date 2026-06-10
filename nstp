@@ -181,6 +181,10 @@ cmd_wg() {
             echo "Server IP : ${WG_SERVER_ADDR:-10.66.66.1/24}"
             echo "Client IP : ${WG_CLIENT_ADDR:-10.66.66.2/32}"
             echo "Allow from: ${WG_ALLOWED_SOURCE:-any}"
+            echo "Host mode : ${WG_BRIDGE_HOST_MODE:-client-wg}"
+            if [[ "${WG_BRIDGE_HOST_MODE:-client-wg}" == "relay-tcp" ]]; then
+                echo "Public host: ${WG_RELAY_PUBLIC_ADDRESS:-unset}:${WG_RELAY_PUBLIC_PORT:-443}"
+            fi
             echo ""
             wg show "${WG_IFACE:-wg-web}" 2>/dev/null || echo "wg interface is not up"
             ;;
@@ -196,6 +200,10 @@ cmd_wg() {
             if [[ "$NODE_PROFILE" == "wg-connector" && -f "${STATE_DIR}/xray-wg-bridge-template.json" ]]; then
                 echo "# WG connector XRAY_JSON template:"
                 cat "${STATE_DIR}/xray-wg-bridge-template.json"
+                echo ""
+            elif [[ "$NODE_PROFILE" == "wg-connector" && "${WG_BRIDGE_HOST_MODE:-client-wg}" == "relay-tcp" ]]; then
+                echo "# WG connector relay-tcp mode does not use XRAY_JSON wg-out template."
+                echo "# Client connects to ${WG_RELAY_PUBLIC_ADDRESS:-BS_RELAY}:${WG_RELAY_PUBLIC_PORT:-443}; BS relays TCP to ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT:-9443}."
                 echo ""
             fi
             if [[ -f "${STATE_DIR}/xray-wg-vless-client-example.json" ]]; then
@@ -431,7 +439,13 @@ cmd_diag() {
         else
             _chk_line "$FAIL" "WireGuard" "${WG_IFACE:-wg-web} is not up" "systemctl status wg-quick@${WG_IFACE:-wg-web}"
         fi
-        if [[ -f "${STATE_DIR}/xray-wg-bridge-template.json" && -n "${WG_BRIDGE_TEMPLATE_UUID:-}" ]]; then
+        if [[ "${WG_BRIDGE_HOST_MODE:-client-wg}" == "relay-tcp" ]]; then
+            if [[ -n "${WG_RELAY_PUBLIC_ADDRESS:-}" ]]; then
+                _chk_line "$OK" "Host publication" "relay-tcp ${WG_RELAY_PUBLIC_ADDRESS}:${WG_RELAY_PUBLIC_PORT:-443} -> ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT:-9443}"
+            else
+                _chk_line "$FAIL" "Host publication" "relay-tcp public address missing" "re-run with --wg-relay-public-address"
+            fi
+        elif [[ -f "${STATE_DIR}/xray-wg-bridge-template.json" && -n "${WG_BRIDGE_TEMPLATE_UUID:-}" ]]; then
             _chk_line "$OK" "XRAY_JSON template" "${WG_BRIDGE_TEMPLATE_UUID}"
         else
             _chk_line "$FAIL" "XRAY_JSON template" "missing template state" "re-run node-bootstrap.sh --profile wg-connector"

@@ -80,6 +80,9 @@ WG_BRIDGE_TARGET="5post-gate.x5.ru:443"
 WG_BRIDGE_SERVER_NAME="5post-gate.x5.ru"
 WG_BRIDGE_TEMPLATE_UUID=""
 WG_BRIDGE_SHORT_IDS=""
+WG_BRIDGE_HOST_MODE="client-wg"      # client-wg | relay-tcp
+WG_RELAY_PUBLIC_ADDRESS=""           # BS public IP/domain for relay-tcp host publication
+WG_RELAY_PUBLIC_PORT="443"           # BS public TCP port for relay-tcp host publication
 
 # Optional upstream exits for the WG bridge server config. These are intentionally
 # CLI-provided: never bake production exit credentials into this repo.
@@ -529,6 +532,9 @@ WG_BRIDGE_TARGET="${WG_BRIDGE_TARGET}"
 WG_BRIDGE_SERVER_NAME="${WG_BRIDGE_SERVER_NAME}"
 WG_BRIDGE_TEMPLATE_UUID="${WG_BRIDGE_TEMPLATE_UUID}"
 WG_BRIDGE_SHORT_IDS="${WG_BRIDGE_SHORT_IDS}"
+WG_BRIDGE_HOST_MODE="${WG_BRIDGE_HOST_MODE}"
+WG_RELAY_PUBLIC_ADDRESS="${WG_RELAY_PUBLIC_ADDRESS}"
+WG_RELAY_PUBLIC_PORT="${WG_RELAY_PUBLIC_PORT}"
 WG_EXIT_RU_ADDRESS="${WG_EXIT_RU_ADDRESS}"
 WG_EXIT_RU_PORT="${WG_EXIT_RU_PORT}"
 WG_EXIT_RU_UUID="${WG_EXIT_RU_UUID}"
@@ -678,6 +684,9 @@ collect_params() {
     local cli_wg_bridge_port="$WG_BRIDGE_PORT"
     local cli_wg_bridge_target="$WG_BRIDGE_TARGET"
     local cli_wg_bridge_server_name="$WG_BRIDGE_SERVER_NAME"
+    local cli_wg_bridge_host_mode="$WG_BRIDGE_HOST_MODE"
+    local cli_wg_relay_public_address="$WG_RELAY_PUBLIC_ADDRESS"
+    local cli_wg_relay_public_port="$WG_RELAY_PUBLIC_PORT"
     local cli_wg_exit_ru_address="$WG_EXIT_RU_ADDRESS"
     local cli_wg_exit_ru_port="$WG_EXIT_RU_PORT"
     local cli_wg_exit_ru_uuid="$WG_EXIT_RU_UUID"
@@ -729,6 +738,9 @@ collect_params() {
     [[ "$cli_wg_bridge_port" != "9443" ]] && WG_BRIDGE_PORT="$cli_wg_bridge_port"
     [[ "$cli_wg_bridge_target" != "5post-gate.x5.ru:443" ]] && WG_BRIDGE_TARGET="$cli_wg_bridge_target"
     [[ "$cli_wg_bridge_server_name" != "5post-gate.x5.ru" ]] && WG_BRIDGE_SERVER_NAME="$cli_wg_bridge_server_name"
+    [[ "$cli_wg_bridge_host_mode" != "client-wg" ]] && WG_BRIDGE_HOST_MODE="$cli_wg_bridge_host_mode"
+    [[ -n "$cli_wg_relay_public_address" ]] && WG_RELAY_PUBLIC_ADDRESS="$cli_wg_relay_public_address"
+    [[ "$cli_wg_relay_public_port" != "443" ]] && WG_RELAY_PUBLIC_PORT="$cli_wg_relay_public_port"
     [[ -n "$cli_wg_exit_ru_address" ]] && WG_EXIT_RU_ADDRESS="$cli_wg_exit_ru_address"
     [[ "$cli_wg_exit_ru_port" != "443" ]] && WG_EXIT_RU_PORT="$cli_wg_exit_ru_port"
     [[ -n "$cli_wg_exit_ru_uuid" ]] && WG_EXIT_RU_UUID="$cli_wg_exit_ru_uuid"
@@ -862,6 +874,15 @@ collect_params() {
         fi
         [[ "$WG_MTU" =~ ^[0-9]+$ ]] || { log_error "--wg-mtu must be numeric"; exit 1; }
         [[ "$WG_BRIDGE_PORT" =~ ^[0-9]+$ ]] || { log_error "--wg-bridge-port must be numeric"; exit 1; }
+        [[ "$WG_RELAY_PUBLIC_PORT" =~ ^[0-9]+$ ]] || { log_error "--wg-relay-public-port must be numeric"; exit 1; }
+        case "$WG_BRIDGE_HOST_MODE" in
+            client-wg|relay-tcp) ;;
+            *) log_error "--wg-host-mode must be client-wg or relay-tcp"; exit 1 ;;
+        esac
+        if [[ "$WG_BRIDGE_HOST_MODE" == "relay-tcp" && -z "$WG_RELAY_PUBLIC_ADDRESS" ]]; then
+            [[ "$NON_INTERACTIVE" == true ]] && { log_error "--wg-relay-public-address is required when --wg-host-mode relay-tcp"; exit 1; }
+            read -rp "  BS relay public address for Remnawave host: " WG_RELAY_PUBLIC_ADDRESS
+        fi
     fi
 
     log_info "DOMAIN  : ${DOMAIN}"
@@ -876,6 +897,11 @@ collect_params() {
     if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
         log_info "WG MODE : bridge profile ${WG_BRIDGE_INBOUND_TAG} on ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT} (mtu ${WG_MTU})"
         log_info "WG MASK : ${WG_BRIDGE_SERVER_NAME} via ${WG_BRIDGE_TARGET}"
+        if [[ "$WG_BRIDGE_HOST_MODE" == "relay-tcp" ]]; then
+            log_info "WG HOST : relay-tcp public ${WG_RELAY_PUBLIC_ADDRESS}:${WG_RELAY_PUBLIC_PORT} -> ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT}"
+        else
+            log_info "WG HOST : client-wg internal ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT} with XRAY_JSON wg-out"
+        fi
     fi
 }
 
@@ -2472,18 +2498,28 @@ setup_wg_bridge_host() {
     log_step "Creating WG bridge template + host in panel"
     [[ "$DRY_RUN" == true ]] && { log_dry "POST/PATCH /api/subscription-templates + POST /api/hosts"; STEP_STATUS["hosts"]="DRY"; return 0; }
 
-    local server_ip="${WG_SERVER_ADDR%%/*}"
-    local template_json; template_json="$(build_wg_bridge_xray_template)"
-    log_info "Creating/updating XRAY_JSON template '${NODE_NAME}'..."
-    WG_BRIDGE_TEMPLATE_UUID="$(panel_upsert_xray_json_template "$NODE_NAME" "$template_json")" || {
-        log_error "Failed to create/update XRAY_JSON subscription template"
-        STEP_STATUS["hosts"]="FAILED"
-        return 1
-    }
-
     mkdir -p "$STATE_DIR"
-    printf '%s\n' "$template_json" > "${STATE_DIR}/xray-wg-bridge-template.json"
-    chmod 600 "${STATE_DIR}/xray-wg-bridge-template.json"
+
+    local host_addr host_port template_json
+    if [[ "$WG_BRIDGE_HOST_MODE" == "relay-tcp" ]]; then
+        host_addr="$WG_RELAY_PUBLIC_ADDRESS"
+        host_port="$WG_RELAY_PUBLIC_PORT"
+        WG_BRIDGE_TEMPLATE_UUID=""
+        rm -f "${STATE_DIR}/xray-wg-bridge-template.json"
+        log_info "WG relay-tcp host will publish ${host_addr}:${host_port} (BS relay), internal target ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT}"
+    else
+        host_addr="${WG_SERVER_ADDR%%/*}"
+        host_port="$WG_BRIDGE_PORT"
+        template_json="$(build_wg_bridge_xray_template)"
+        log_info "Creating/updating XRAY_JSON template '${NODE_NAME}'..."
+        WG_BRIDGE_TEMPLATE_UUID="$(panel_upsert_xray_json_template "$NODE_NAME" "$template_json")" || {
+            log_error "Failed to create/update XRAY_JSON subscription template"
+            STEP_STATUS["hosts"]="FAILED"
+            return 1
+        }
+        printf '%s\n' "$template_json" > "${STATE_DIR}/xray-wg-bridge-template.json"
+        chmod 600 "${STATE_DIR}/xray-wg-bridge-template.json"
+    fi
 
     local flag; flag="$(country_flag "$COUNTRY_CODE")"
     local remark="[${NODE_NAME}] ${flag} LTE"
@@ -2491,39 +2527,62 @@ setup_wg_bridge_host() {
     (( ${#remark} > 32 )) && remark="${NODE_NAME} LTE"
 
     local sockopt body resp
-    sockopt="$(_wg_bridge_sockopt_json)"
-    body="$(jq -n \
-        --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
-        --arg remark "$remark" --arg addr "$server_ip" \
-        --argjson port "$WG_BRIDGE_PORT" \
-        --arg sni "$WG_BRIDGE_SERVER_NAME" --arg fp "$DEFAULT_FP" \
-        --arg tag "ROUTING_HOST" --arg node "$NODE_UUID" \
-        --arg tpl "$WG_BRIDGE_TEMPLATE_UUID" \
-        --argjson sockopt "$sockopt" \
-        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
-          remark:$remark, address:$addr, port:$port,
-          sni:$sni,
-          fingerprint:$fp, tag:$tag,
-          securityLayer:"DEFAULT",
-          xrayJsonTemplateUuid:$tpl,
-          sockoptParams:$sockopt,
-          nodes:[$node]}')"
+    if [[ "$WG_BRIDGE_HOST_MODE" == "relay-tcp" ]]; then
+        body="$(jq -n \
+            --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
+            --arg remark "$remark" --arg addr "$host_addr" \
+            --argjson port "$host_port" \
+            --arg sni "$WG_BRIDGE_SERVER_NAME" --arg fp "$DEFAULT_FP" \
+            --arg tag "ROUTING_HOST" --arg node "$NODE_UUID" \
+            '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+              remark:$remark, address:$addr, port:$port,
+              sni:$sni,
+              fingerprint:$fp, tag:$tag,
+              securityLayer:"DEFAULT",
+              nodes:[$node]}')"
+    else
+        sockopt="$(_wg_bridge_sockopt_json)"
+        body="$(jq -n \
+            --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
+            --arg remark "$remark" --arg addr "$host_addr" \
+            --argjson port "$host_port" \
+            --arg sni "$WG_BRIDGE_SERVER_NAME" --arg fp "$DEFAULT_FP" \
+            --arg tag "ROUTING_HOST" --arg node "$NODE_UUID" \
+            --arg tpl "$WG_BRIDGE_TEMPLATE_UUID" \
+            --argjson sockopt "$sockopt" \
+            '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+              remark:$remark, address:$addr, port:$port,
+              sni:$sni,
+              fingerprint:$fp, tag:$tag,
+              securityLayer:"DEFAULT",
+              xrayJsonTemplateUuid:$tpl,
+              sockoptParams:$sockopt,
+              nodes:[$node]}')"
+    fi
     resp="$(panel_create_host "$body")" || { log_error "Failed to create WG bridge host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
     local h_bridge; h_bridge="$(echo "$resp" | jq -r '.response.uuid')"
 
     jq -n --arg n "$NODE_UUID" --arg p "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
-          --arg h "$h_bridge" --arg t "$WG_BRIDGE_TEMPLATE_UUID" --arg now "$(date -Iseconds)" \
+          --arg h "$h_bridge" --arg t "$WG_BRIDGE_TEMPLATE_UUID" --arg mode "$WG_BRIDGE_HOST_MODE" \
+          --arg addr "$host_addr" --argjson port "$host_port" --arg now "$(date -Iseconds)" \
         '{
             node_uuid: $n,
             config_profile_uuid: $p,
             inbound_bridge_uuid: $ib,
             bridge_host_uuid: $h,
             xray_json_template_uuid: $t,
+            host_mode: $mode,
+            host_address: $addr,
+            host_port: $port,
             created_at: $now
         }' > "${STATE_DIR}/wg-bridge.json"
     chmod 600 "${STATE_DIR}/wg-bridge.json"
 
-    log_ok "Created WG bridge host: ${h_bridge} (template ${WG_BRIDGE_TEMPLATE_UUID})"
+    if [[ "$WG_BRIDGE_HOST_MODE" == "relay-tcp" ]]; then
+        log_ok "Created WG relay-tcp host: ${h_bridge} (${host_addr}:${host_port})"
+    else
+        log_ok "Created WG bridge host: ${h_bridge} (template ${WG_BRIDGE_TEMPLATE_UUID})"
+    fi
     STEP_STATUS["hosts"]="OK"
 }
 
@@ -2829,7 +2888,15 @@ print_summary() {
         echo -e "  ${BOLD}WireGuard:${RESET} ${WG_IFACE} ${WG_SERVER_ADDR} udp/${WG_PORT} mtu/${WG_MTU}"
         echo -e "  ${BOLD}WG client:${RESET} ${STATE_DIR}/wg-client.conf"
         echo -e "  ${BOLD}Xray WG:${RESET}   ${STATE_DIR}/xray-wireguard-outbound.json"
-        [[ "$WITH_WG_BRIDGE_PROFILE" == true ]] && echo -e "  ${BOLD}WG template:${RESET} ${STATE_DIR}/xray-wg-bridge-template.json"
+        if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+            echo -e "  ${BOLD}WG host mode:${RESET} ${WG_BRIDGE_HOST_MODE}"
+            if [[ "$WG_BRIDGE_HOST_MODE" == "relay-tcp" ]]; then
+                echo -e "  ${BOLD}Public host:${RESET} ${WG_RELAY_PUBLIC_ADDRESS}:${WG_RELAY_PUBLIC_PORT}"
+                echo -e "  ${BOLD}WG target:${RESET}   ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT}"
+            else
+                echo -e "  ${BOLD}WG template:${RESET} ${STATE_DIR}/xray-wg-bridge-template.json"
+            fi
+        fi
     fi
     echo ""
     echo -e "  ${BOLD}Next:${RESET}"
@@ -2837,7 +2904,12 @@ print_summary() {
         echo "    - nstp status      -- verify everything green"
         echo "    - nstp wg status   -- verify WireGuard server state"
         echo "    - In panel: attach the WG bridge host to your squad(s)"
-        echo "    - Client enters through BS relay UDP, then VLESS/raw reaches ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT}"
+        if [[ "$WG_BRIDGE_HOST_MODE" == "relay-tcp" ]]; then
+            echo "    - Client connects to BS TCP ${WG_RELAY_PUBLIC_ADDRESS}:${WG_RELAY_PUBLIC_PORT}; BS relays to ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT}"
+            echo "    - Do not attach XRAY_JSON wg-out template to this host"
+        else
+            echo "    - Client enters through BS relay UDP, then VLESS/raw reaches ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT}"
+        fi
         echo ""
         return 0
     fi
@@ -2911,6 +2983,11 @@ ${BOLD}Optional:${RESET}
   --wg-bridge-port <p>    bridge VLESS port inside WG (default: ${WG_BRIDGE_PORT})
   --wg-reality-target <h:p> bridge Reality target (default: ${WG_BRIDGE_TARGET})
   --wg-reality-sni <host> bridge Reality serverName/SNI (default: ${WG_BRIDGE_SERVER_NAME})
+  --wg-host-mode <mode>   client-wg | relay-tcp (default: ${WG_BRIDGE_HOST_MODE})
+  --wg-relay-public-address <h>
+                          BS public IP/domain for relay-tcp host publication
+  --wg-relay-public-port <p>
+                          BS public TCP port for relay-tcp host publication (default: ${WG_RELAY_PUBLIC_PORT})
   --wg-exit-ru-address <h> optional upstream VLESS exit address for -EXIT-RU
   --wg-exit-ru-uuid <u>   optional upstream VLESS exit UUID for -EXIT-RU
   --wg-exit-ru-pbk <k>    optional upstream Reality public key for -EXIT-RU
@@ -2955,6 +3032,13 @@ ${BOLD}Examples:${RESET}
       --panel-url https://panel.example.com --panel-token rw_xxx \\
       --country RU --hosting AEZA --profile wg-connector \\
       --wg-allow-from <BS_RELAY_IP> --wg-mtu 760 -y
+
+  # WG connector for server-bootstrap xray-wg-relay: client connects to BS:443, BS relays TCP to 10.66.66.1:9443:
+  bash ${SCRIPT_NAME} --domain node.example.com --cf-token cf_xxx \\
+      --panel-url https://panel.example.com --panel-token rw_xxx \\
+      --country RU --hosting AEZA --profile wg-connector \\
+      --wg-host-mode relay-tcp --wg-relay-public-address <BS_RELAY_IP_OR_DOMAIN> \\
+      --wg-relay-public-port 443 --wg-allow-from <BS_RELAY_IP> --wg-mtu 760 -y
 EOF
 }
 
@@ -2990,6 +3074,9 @@ parse_args() {
             --wg-bridge-port)       WG_BRIDGE_PORT="$2";      shift 2 ;;
             --wg-reality-target)    WG_BRIDGE_TARGET="$2";    shift 2 ;;
             --wg-reality-sni)       WG_BRIDGE_SERVER_NAME="$2"; shift 2 ;;
+            --wg-host-mode)         WG_BRIDGE_HOST_MODE="$2"; shift 2 ;;
+            --wg-relay-public-address) WG_RELAY_PUBLIC_ADDRESS="$2"; shift 2 ;;
+            --wg-relay-public-port) WG_RELAY_PUBLIC_PORT="$2"; shift 2 ;;
             --wg-exit-ru-address)   WG_EXIT_RU_ADDRESS="$2";  shift 2 ;;
             --wg-exit-ru-port)      WG_EXIT_RU_PORT="$2";     shift 2 ;;
             --wg-exit-ru-uuid)      WG_EXIT_RU_UUID="$2";     shift 2 ;;

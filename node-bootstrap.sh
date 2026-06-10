@@ -3,7 +3,7 @@
 #  node-bootstrap.sh — Remnawave node installer (full API-driven setup)
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
 #
-#  v1.1.2 — node creation + config-profile creation + hosts creation all via API
+#  v1.1.3 — explicit install profiles + API-driven node/config/host creation
 #
 #  Usage (interactive):     bash node-bootstrap.sh
 #  Usage (non-interactive): bash node-bootstrap.sh --country NL --hosting 1CENT ... -y
@@ -19,7 +19,7 @@ IFS=$'\n\t'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.1.2"
+readonly SCRIPT_VERSION="1.1.3"
 readonly SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/node-bootstrap.log"
 readonly STATE_DIR="/opt/web/state"
@@ -56,6 +56,8 @@ SKIP_UPDATE=false
 UNINSTALL=false
 WITH_MONITORING=false
 MONITOR_FROM_IP=""         # IP of the panel/Prometheus server allowed to scrape :9100
+NODE_PROFILE="multi-sni-rotator"  # multi-sni-rotator | wg-connector
+PROFILE_EXPLICIT=false
 WITH_WG_SERVER=false       # Optional WireGuard server for BS wg-relay / Xray dialerProxy
 WG_IFACE="wg-web"
 WG_PORT="51820"
@@ -316,7 +318,7 @@ print_header() {
 
   ${BOLD}╔══════════════════════════════════════════════════════════╗${RESET}
   ${BOLD}║          NODE BOOTSTRAP  ·  ${SCRIPT_VERSION}                           ║${RESET}
-  ${BOLD}║          Remnawave node + rotating SNI + selfsteal      ║${RESET}
+  ${BOLD}║          Remnawave node profiles: SNI or WG connector   ║${RESET}
   ${BOLD}║          Full API-driven setup                          ║${RESET}
   ${BOLD}╚══════════════════════════════════════════════════════════╝${RESET}
 EOF
@@ -509,6 +511,7 @@ HYS_PASSWORD="${HYS_PASSWORD}"
 HYS_OBFS_PASSWORD="${HYS_OBFS_PASSWORD}"
 STUB_NAME="${STUB_NAME}"
 
+NODE_PROFILE="${NODE_PROFILE}"
 WITH_WG_SERVER="${WITH_WG_SERVER}"
 WG_IFACE="${WG_IFACE}"
 WG_PORT="${WG_PORT}"
@@ -661,6 +664,8 @@ panel_upsert_xray_json_template() {
 collect_params() {
     log_step "Collecting installation parameters"
 
+    local cli_profile="$NODE_PROFILE"
+    local cli_profile_explicit="$PROFILE_EXPLICIT"
     local cli_with_wg_server="$WITH_WG_SERVER"
     local cli_with_wg_bridge_profile="$WITH_WG_BRIDGE_PROFILE"
     local cli_wg_port="$WG_PORT"
@@ -695,6 +700,22 @@ collect_params() {
     if state_load 2>/dev/null; then
         log_info "Loaded previous install state from ${CONFIG_FILE}"
     fi
+
+    if [[ "$cli_profile_explicit" == true ]]; then
+        NODE_PROFILE="$cli_profile"
+    elif [[ "$cli_with_wg_bridge_profile" == true ]]; then
+        NODE_PROFILE="wg-connector"
+    elif [[ -z "${NODE_PROFILE:-}" ]]; then
+        if [[ "${WITH_WG_BRIDGE_PROFILE:-false}" == true ]]; then
+            NODE_PROFILE="wg-connector"
+        else
+            NODE_PROFILE="multi-sni-rotator"
+        fi
+    fi
+    case "$NODE_PROFILE" in
+        multi-sni-rotator|wg-connector) ;;
+        *) log_error "--profile must be multi-sni-rotator or wg-connector"; exit 1 ;;
+    esac
 
     [[ "$cli_with_wg_server" == true ]] && WITH_WG_SERVER=true
     [[ "$cli_with_wg_bridge_profile" == true ]] && WITH_WG_BRIDGE_PROFILE=true
@@ -826,6 +847,13 @@ collect_params() {
         XHTTP_PATH="${XHTTP_PATH_POOL[$RANDOM % ${#XHTTP_PATH_POOL[@]}]}"
     fi
 
+    if [[ "$NODE_PROFILE" == "wg-connector" ]]; then
+        WITH_WG_SERVER=true
+        WITH_WG_BRIDGE_PROFILE=true
+    else
+        WITH_WG_BRIDGE_PROFILE=false
+    fi
+
     if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
         WITH_WG_SERVER=true
         [[ -z "$WG_BRIDGE_INBOUND_TAG" ]] && WG_BRIDGE_INBOUND_TAG="${COUNTRY_CODE}-${NODE_SEQUENCE}"
@@ -838,10 +866,13 @@ collect_params() {
 
     log_info "DOMAIN  : ${DOMAIN}"
     log_info "NODE    : ${NODE_NAME}  $(country_flag "$COUNTRY_CODE") $(country_name "$COUNTRY_CODE")"
+    log_info "PROFILE : ${NODE_PROFILE}"
     log_info "TAG     : ${TAG_PREFIX}"
     log_info "PANEL   : ${PANEL_URL}"
-    log_info "SNI POL : ${ACTIVE_SNIS}× active × every ${ROTATION_DAYS}d (style: ${SNI_STYLE}, fp: ${DEFAULT_FP})"
-    log_info "XHTTP   : ${XHTTP_PATH}"
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        log_info "SNI POL : ${ACTIVE_SNIS}× active × every ${ROTATION_DAYS}d (style: ${SNI_STYLE}, fp: ${DEFAULT_FP})"
+        log_info "XHTTP   : ${XHTTP_PATH}"
+    fi
     if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
         log_info "WG MODE : bridge profile ${WG_BRIDGE_INBOUND_TAG} on ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT} (mtu ${WG_MTU})"
         log_info "WG MASK : ${WG_BRIDGE_SERVER_NAME} via ${WG_BRIDGE_TARGET}"
@@ -944,16 +975,18 @@ setup_ufw() {
     log_step "Configuring UFW"
     install_packages ufw
     local sp; sp="$(_get_ssh_port)"
-    [[ "$DRY_RUN" == true ]] && { log_dry "UFW: SSH(${sp}), 80, 443, 8443, 9443, ${NODE_PORT}"; STEP_STATUS["ufw"]="DRY"; return 0; }
+    [[ "$DRY_RUN" == true ]] && { log_dry "UFW: SSH(${sp}), ${NODE_PORT}${NODE_PROFILE:+, profile=${NODE_PROFILE}}"; STEP_STATUS["ufw"]="DRY"; return 0; }
     [[ "$IS_CONTAINER" == true ]] && { log_warn "Container — skipping UFW"; STEP_STATUS["ufw"]="SKIPPED(container)"; return 0; }
     ufw --force reset           &>/dev/null
     ufw default deny incoming   &>/dev/null
     ufw default allow outgoing  &>/dev/null
     ufw allow "${sp}/tcp"       comment 'SSH'                 &>/dev/null
-    ufw allow 80/tcp            comment 'ACME HTTP-01'         &>/dev/null
-    ufw allow 443/tcp           comment 'Xray Reality TCP'     &>/dev/null
-    ufw allow 8443/tcp          comment 'Xray Reality gRPC'    &>/dev/null
-    ufw allow 9443/udp          comment 'Hysteria2'            &>/dev/null
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        ufw allow 80/tcp            comment 'ACME HTTP-01'         &>/dev/null
+        ufw allow 443/tcp           comment 'Xray Reality TCP'     &>/dev/null
+        ufw allow 8443/tcp          comment 'Xray Reality gRPC'    &>/dev/null
+        ufw allow 9443/udp          comment 'Hysteria2'            &>/dev/null
+    fi
     ufw allow "${NODE_PORT}/tcp" comment 'panel → node ctrl'   &>/dev/null
     ufw show added 2>/dev/null | grep -q "ufw allow ${sp}" || {
         log_error "SAFETY ABORT: SSH not in UFW rules"
@@ -961,7 +994,11 @@ setup_ufw() {
         return 1
     }
     ufw --force enable &>/dev/null
-    log_ok "UFW enabled (ssh:${sp}, 80, 443, 8443, 9443/udp, ${NODE_PORT})"
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        log_ok "UFW enabled (ssh:${sp}, 80, 443, 8443, 9443/udp, ${NODE_PORT})"
+    else
+        log_ok "UFW enabled (ssh:${sp}, ${NODE_PORT}; WG rules applied in WireGuard step)"
+    fi
     STEP_STATUS["ufw"]="OK"
 }
 
@@ -1199,7 +1236,7 @@ EOF
 }
 
 setup_fail2ban() {
-    log_step "Configuring Fail2Ban (sshd + web-nginx scanners)"
+    log_step "Configuring Fail2Ban"
     install_packages fail2ban
     [[ "$DRY_RUN" == true ]] && { log_dry "fail2ban jails"; STEP_STATUS["fail2ban"]="DRY"; return 0; }
 
@@ -1208,13 +1245,17 @@ setup_fail2ban() {
     # Filter that matches nginx 405 (try_files POST on unknown XHTTP paths) and
     # 444 (ssl_reject_handshake on unknown SNI). Both signal scanners probing
     # for proxy endpoints — legitimate clients never hit either status.
-    cat > /etc/fail2ban/filter.d/web-nginx.conf <<'F2B'
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        cat > /etc/fail2ban/filter.d/web-nginx.conf <<'F2B'
 [Definition]
 # Log format from our site.conf:
 #   $proxy_protocol_addr - $remote_user [$time_local] "$request" $status $size
 failregex = ^<HOST>\s.*"(?:POST|GET|HEAD|PUT|DELETE)[^"]*"\s(?:405|444)\s
 ignoreregex =
 F2B
+    else
+        rm -f /etc/fail2ban/filter.d/web-nginx.conf 2>/dev/null || true
+    fi
 
     cat > /etc/fail2ban/jail.local <<EOF
 [DEFAULT]
@@ -1227,7 +1268,10 @@ ignoreip = 127.0.0.1/8 ::1 ${NODE_PUBLIC_IP}
 [sshd]
 enabled = true
 port    = ${sp}
+EOF
 
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        cat >> /etc/fail2ban/jail.local <<EOF
 [web-nginx]
 enabled  = true
 filter   = web-nginx
@@ -1237,10 +1281,13 @@ maxretry = 20
 findtime = 1h
 bantime  = 6h
 EOF
-    log_info "Created jail.local (sshd:${sp} + web-nginx 20/h → 6h ban)"
+        log_info "Created jail.local (sshd:${sp} + web-nginx 20/h -> 6h ban)"
+    else
+        log_info "Created jail.local (sshd:${sp}; wg-connector has no nginx jail)"
+    fi
     systemctl enable fail2ban &>/dev/null
     systemctl restart fail2ban
-    log_ok "Fail2Ban running with 2 jails"
+    [[ "$NODE_PROFILE" == "multi-sni-rotator" ]] && log_ok "Fail2Ban running with sshd + web-nginx jails" || log_ok "Fail2Ban running with sshd jail"
     STEP_STATUS["fail2ban"]="OK"
 }
 
@@ -1249,13 +1296,14 @@ EOF
 # ─────────────────────────────────────────────────────────────────────────────
 
 setup_logrotate() {
-    log_step "Setting up logrotate for nginx + xray"
+    log_step "Setting up logrotate"
     [[ "$DRY_RUN" == true ]] && { log_dry "logrotate configs"; STEP_STATUS["logrotate"]="DRY"; return 0; }
     install_packages logrotate
 
-    # Nginx access/error logs — written to host bind mount, easy to rotate.
-    # Send a nginx -s reopen signal after rotation so new file handles are taken.
-    cat > /etc/logrotate.d/web-nginx <<EOF
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        # Nginx access/error logs — written to host bind mount, easy to rotate.
+        # Send a nginx -s reopen signal after rotation so new file handles are taken.
+        cat > /etc/logrotate.d/web-nginx <<EOF
 ${NGINX_DIR}/logs/*.log {
     daily
     rotate 14
@@ -1270,6 +1318,9 @@ ${NGINX_DIR}/logs/*.log {
     endscript
 }
 EOF
+    else
+        rm -f /etc/logrotate.d/web-nginx 2>/dev/null || true
+    fi
 
     # Xray supervisor logs — mounted from container to host (see setup_node).
     # No signal needed — supervisord rotates files internally per restart.
@@ -1286,7 +1337,7 @@ ${NODE_DIR}/logs/*.log {
 }
 EOF
 
-    log_ok "logrotate configured (14 days retention, daily, gzip)"
+    [[ "$NODE_PROFILE" == "multi-sni-rotator" ]] && log_ok "logrotate configured for nginx + xray" || log_ok "logrotate configured for xray"
     STEP_STATUS["logrotate"]="OK"
 }
 
@@ -2192,7 +2243,11 @@ generate_initial_sni() {
 setup_panel_resources() {
     log_step "Creating resources in panel via API"
     [[ "$DRY_RUN" == true ]] && {
-        log_dry "Would: GET /api/keygen, POST /api/config-profiles, POST /api/nodes, POST /api/hosts ×4"
+        if [[ "$NODE_PROFILE" == "wg-connector" ]]; then
+            log_dry "Would: GET /api/keygen, POST /api/config-profiles, POST /api/nodes, POST XRAY_JSON template, POST /api/hosts x1"
+        else
+            log_dry "Would: GET /api/keygen, POST /api/config-profiles, POST /api/nodes, POST /api/hosts x4"
+        fi
         STEP_STATUS["panel"]="DRY"
         return 0
     }
@@ -2346,21 +2401,25 @@ setup_panel_resources() {
     fi
     log_ok "Node has ${active_count} active inbounds linked"
 
-    # Persist Initial SNI as our first AUTOSNI record (state file initialized)
-    mkdir -p "$STATE_DIR"
-    local now; now="$(date -Iseconds)"
-    jq -n --arg n "$NODE_UUID" --arg p "$CONFIG_PROFILE_UUID" \
-          --arg rt "$NODE_INBOUND_REALITY_UUID" --arg rg "$NODE_INBOUND_GRPC_UUID" \
-          --arg sni "$initial_sni" --arg now "$now" \
-        '{
-            node_uuid: $n,
-            config_profile_uuid: $p,
-            inbound_reality_uuid: $rt,
-            inbound_grpc_uuid: $rg,
-            active_snis: [{sni: $sni, host_reality_uuid: "", host_grpc_uuid: "", created_at: $now}],
-            last_rotation: $now
-        }' > "${STATE_DIR}/sni.json"
-    chmod 600 "${STATE_DIR}/sni.json"
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        # Persist Initial SNI as our first AUTOSNI record (state file initialized).
+        mkdir -p "$STATE_DIR"
+        local now; now="$(date -Iseconds)"
+        jq -n --arg n "$NODE_UUID" --arg p "$CONFIG_PROFILE_UUID" \
+              --arg rt "$NODE_INBOUND_REALITY_UUID" --arg rg "$NODE_INBOUND_GRPC_UUID" \
+              --arg sni "$initial_sni" --arg now "$now" \
+            '{
+                node_uuid: $n,
+                config_profile_uuid: $p,
+                inbound_reality_uuid: $rt,
+                inbound_grpc_uuid: $rg,
+                active_snis: [{sni: $sni, host_reality_uuid: "", host_grpc_uuid: "", created_at: $now}],
+                last_rotation: $now
+            }' > "${STATE_DIR}/sni.json"
+        chmod 600 "${STATE_DIR}/sni.json"
+    else
+        rm -f "${STATE_DIR}/sni.json" 2>/dev/null || true
+    fi
 
     STEP_STATUS["panel"]="OK"
 }
@@ -2692,10 +2751,10 @@ EOF
 
 install_sni_rotator() {
     log_step "Installing SNI rotator"
-    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
-        log_info "WG bridge profile uses a fixed Reality serverName; skipping SNI rotator"
+    if [[ "$NODE_PROFILE" == "wg-connector" ]]; then
+        log_info "WG connector uses a fixed Reality serverName; skipping SNI rotator"
         rm -f /etc/cron.d/web-sni-rotate 2>/dev/null || true
-        STEP_STATUS["sni_rotator"]="SKIPPED(wg-bridge)"
+        STEP_STATUS["sni_rotator"]="SKIPPED(wg-connector)"
         return 0
     fi
     [[ "$DRY_RUN" == true ]] && { log_dry "Install ${SNI_ROTATE_BIN} + cron"; STEP_STATUS["sni_rotator"]="DRY"; return 0; }
@@ -2763,8 +2822,9 @@ print_summary() {
     done | sort
     echo ""
     echo -e "  ${BOLD}Node:${RESET}      ${NODE_NAME} $(country_flag "$COUNTRY_CODE") $(country_name "$COUNTRY_CODE")"
+    echo -e "  ${BOLD}Profile:${RESET}   ${NODE_PROFILE}"
     echo -e "  ${BOLD}Panel UUID:${RESET} ${NODE_UUID}"
-    echo -e "  ${BOLD}Profile:${RESET}    ${CONFIG_PROFILE_UUID}"
+    echo -e "  ${BOLD}Config:${RESET}    ${CONFIG_PROFILE_UUID}"
     if [[ "$WITH_WG_SERVER" == true ]]; then
         echo -e "  ${BOLD}WireGuard:${RESET} ${WG_IFACE} ${WG_SERVER_ADDR} udp/${WG_PORT} mtu/${WG_MTU}"
         echo -e "  ${BOLD}WG client:${RESET} ${STATE_DIR}/wg-client.conf"
@@ -2773,7 +2833,7 @@ print_summary() {
     fi
     echo ""
     echo -e "  ${BOLD}Next:${RESET}"
-    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+    if [[ "$NODE_PROFILE" == "wg-connector" ]]; then
         echo "    - nstp status      -- verify everything green"
         echo "    - nstp wg status   -- verify WireGuard server state"
         echo "    - In panel: attach the WG bridge host to your squad(s)"
@@ -2829,6 +2889,9 @@ ${BOLD}Required:${RESET}
   --country <CC>          ISO-2 country code (e.g. NL, FI, DE)
 
 ${BOLD}Optional:${RESET}
+  --profile <name>        install profile: multi-sni-rotator | wg-connector (default: ${NODE_PROFILE})
+  --multi-sni-rotator     alias for --profile multi-sni-rotator
+  --wg-connector          alias for --profile wg-connector
   --hosting <name>        hosting suffix (e.g. 1CENT, HETZNER) — appended to node name
   --seq <NN>              force sequence number (otherwise auto-detected from panel)
   --node-port <p>         control port for panel ↔ node (default: ${NODE_PORT})
@@ -2843,7 +2906,7 @@ ${BOLD}Optional:${RESET}
   --wg-server-addr <cidr> WireGuard server address (default: ${WG_SERVER_ADDR})
   --wg-client-addr <cidr> WireGuard generated client address (default: ${WG_CLIENT_ADDR})
   --wg-allow-from <ip>    only allow WireGuard UDP from this BS relay IP in UFW
-  --wg-bridge-profile     create one WG-only VLESS/raw/Reality profile + XRAY_JSON template
+  --wg-bridge-profile     legacy alias for --profile wg-connector
   --wg-inbound-tag <tag>  bridge inbound tag (default: <CC>-<NN>)
   --wg-bridge-port <p>    bridge VLESS port inside WG (default: ${WG_BRIDGE_PORT})
   --wg-reality-target <h:p> bridge Reality target (default: ${WG_BRIDGE_TARGET})
@@ -2887,10 +2950,10 @@ ${BOLD}Examples:${RESET}
       --panel-url https://panel.example.com --panel-token rw_xxx \\
       --country RU --hosting 1CENT --with-wg-server --wg-allow-from <BS_RELAY_IP> -y
 
-  # WG bridge profile: client enters through BS relay UDP, then VLESS connects to 10.66.66.1:9443:
+  # WG connector profile: client enters through BS relay UDP, then VLESS connects to 10.66.66.1:9443:
   bash ${SCRIPT_NAME} --domain node.example.com --cf-token cf_xxx \\
       --panel-url https://panel.example.com --panel-token rw_xxx \\
-      --country RU --hosting AEZA --with-wg-server --wg-bridge-profile \\
+      --country RU --hosting AEZA --profile wg-connector \\
       --wg-allow-from <BS_RELAY_IP> --wg-mtu 760 -y
 EOF
 }
@@ -2898,6 +2961,10 @@ EOF
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
+            --profile|--node-profile)
+                                      NODE_PROFILE="$2"; PROFILE_EXPLICIT=true; shift 2 ;;
+            --multi-sni-rotator)      NODE_PROFILE="multi-sni-rotator"; PROFILE_EXPLICIT=true; shift ;;
+            --wg-connector)           NODE_PROFILE="wg-connector"; PROFILE_EXPLICIT=true; shift ;;
             --domain)               DOMAIN="$2";              shift 2 ;;
             --cf-token)             CF_TOKEN="$2";            shift 2 ;;
             --panel-url)            PANEL_URL="$2";           shift 2 ;;
@@ -2918,7 +2985,7 @@ parse_args() {
             --wg-server-addr)       WG_SERVER_ADDR="$2";      shift 2 ;;
             --wg-client-addr)       WG_CLIENT_ADDR="$2";      shift 2 ;;
             --wg-allow-from)        WG_ALLOWED_SOURCE="$2";   shift 2 ;;
-            --wg-bridge-profile)    WITH_WG_BRIDGE_PROFILE=true; shift ;;
+            --wg-bridge-profile)    NODE_PROFILE="wg-connector"; PROFILE_EXPLICIT=true; WITH_WG_BRIDGE_PROFILE=true; shift ;;
             --wg-inbound-tag)       WG_BRIDGE_INBOUND_TAG="$2"; shift 2 ;;
             --wg-bridge-port)       WG_BRIDGE_PORT="$2";      shift 2 ;;
             --wg-reality-target)    WG_BRIDGE_TARGET="$2";    shift 2 ;;
@@ -2983,9 +3050,15 @@ main() {
     setup_wireguard_server
     setup_fail2ban
     install_docker
-    setup_cert
-    setup_wildcard_dns
-    setup_nginx_selfsteal
+    if [[ "$NODE_PROFILE" == "multi-sni-rotator" ]]; then
+        setup_cert
+        setup_wildcard_dns
+        setup_nginx_selfsteal
+    else
+        STEP_STATUS["cert"]="SKIPPED(wg-connector)"
+        STEP_STATUS["wildcard_dns"]="SKIPPED(wg-connector)"
+        STEP_STATUS["nginx"]="SKIPPED(wg-connector)"
+    fi
 
     if [[ "$USE_EXISTING_NODE" == false ]]; then
         generate_secrets

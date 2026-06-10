@@ -6,7 +6,7 @@
 
 ## 🇷🇺 Русский
 
-`node-bootstrap.sh` (v1.1.0) поднимает Remnawave-ноду «с нуля и через API»: создаёт config-profile, регистрирует ноду в панели, генерирует Reality x25519 ключи и Hysteria пароли локально, создаёт 4 hosts в подписках, ставит ротатор SNI и CLI `nstp`. От оператора требуются только домен Cloudflare и токены панели — никаких ручных правок в UI панели.
+`node-bootstrap.sh` (v1.1.1) поднимает Remnawave-ноду «с нуля и через API»: создаёт config-profile, регистрирует ноду в панели, генерирует Reality x25519 ключи и Hysteria пароли локально, создаёт 4 hosts в подписках, ставит ротатор SNI и CLI `nstp`. От оператора требуются только домен Cloudflare и токены панели — никаких ручных правок в UI панели.
 
 ### Что устанавливается на сервер
 
@@ -58,9 +58,10 @@ client → BS_RELAY_IP:51820/udp → IPVS/nft relay → NODE_IP:51820/udp
 - клиентский peer `10.66.66.2/32`
 - `/opt/web/state/wg-client.conf`
 - `/opt/web/state/xray-wireguard-outbound.json`
+- `/opt/web/state/xray-wg-vless-client-example.json`
 - `/opt/web/state/xray-dialerproxy-example.json`
 
-В panel/client-конфиге VLESS-outbound должен ходить не на публичный IP ноды, а на внутренний WG-адрес `10.66.66.1:443`, а `sockopt.dialerProxy` должен ссылаться на `wg-out`. Для такого клиента публичная точка входа — BS relay UDP; обычные public-порты ноды пока остаются включены как в стандартной установке.
+Важно: WireGuard outbound относится к **клиентскому Xray config**, а не к серверному config-profile rw-node. Серверный профиль в панели всё ещё содержит Reality/XHTTP/Hysteria inbound'ы. Клиентский VLESS-outbound должен ходить не на публичный IP ноды, а на внутренний WG-адрес `10.66.66.1:443`, а `sockopt.dialerProxy` должен ссылаться на `wg-out`. Для такого клиента публичная точка входа — BS relay UDP; обычные public-порты ноды пока остаются включены как в стандартной установке.
 
 ### Стратегия защиты от блокировок SNI
 
@@ -169,7 +170,8 @@ nstp cert renew         # форс-renew
 nstp fp set chrome      # сменить default FP (новые хосты получат)
 nstp wg status          # WireGuard server status
 nstp wg client          # generated wg-client.conf
-nstp wg xray            # Xray wireguard outbound + dialerProxy пример
+nstp wg xray            # Xray wireguard outbound + full VLESS/dialerProxy пример
+nstp wg refresh         # пересобрать WG/Xray client-файлы из текущего state
 nstp update             # docker compose pull + up -d
 nstp uninstall          # снести всё (с подтверждением)
 ```
@@ -194,6 +196,7 @@ nstp uninstall          # снести всё (с подтверждением)
     ├── sni.json                — текущие 3 активных SNI + UUID хостов + static_hosts
     ├── wg-client.conf          — optional WireGuard client config для BS/Xray
     ├── xray-wireguard-outbound.json
+    ├── xray-wg-vless-client-example.json
     ├── xray-dialerproxy-example.json
     └── version
 

@@ -9,7 +9,7 @@
 #    test [reality|grpc|xhttp|all]  internal protocol probe via Docker Xray client
 #    logs [node|nginx|all]
 #    cert {status|renew}
-#    wg   {status|client|xray}
+#    wg   {status|client|xray|refresh}
 #    sni  {list|rotate|rotate-now}
 #    fp   {show|set <fp>}
 #    update                       docker compose pull + up -d
@@ -152,11 +152,97 @@ cmd_wg() {
             ;;
         xray)
             [[ -f "${STATE_DIR}/xray-wireguard-outbound.json" ]] || { echo "missing ${STATE_DIR}/xray-wireguard-outbound.json"; exit 1; }
+            echo "# WireGuard outbound only:"
             cat "${STATE_DIR}/xray-wireguard-outbound.json"
             echo ""
+            if [[ -f "${STATE_DIR}/xray-wg-vless-client-example.json" ]]; then
+                echo "# Full client-side Xray example: VLESS/Reality via wg-out dialerProxy"
+                cat "${STATE_DIR}/xray-wg-vless-client-example.json"
+                echo ""
+            fi
             [[ -f "${STATE_DIR}/xray-dialerproxy-example.json" ]] && cat "${STATE_DIR}/xray-dialerproxy-example.json"
             ;;
-        *) echo "Usage: nstp wg {status|client|xray}"; exit 2 ;;
+        refresh)
+            [[ "${WITH_WG_SERVER:-false}" == true ]] || { echo "WireGuard server is disabled for this node."; exit 1; }
+            [[ -n "${WG_CLIENT_PRIV:-}" && -n "${WG_SERVER_PUB:-}" ]] || { echo "missing WG keys in ${STATE_DIR}/secrets.env or config.env"; exit 1; }
+            local server_ip="${WG_SERVER_ADDR%%/*}"
+            local endpoint="${WG_ALLOWED_SOURCE:-BS_RELAY_IP}:${WG_PORT:-51820}"
+
+            cat > "${STATE_DIR}/wg-client.conf" <<EOF
+[Interface]
+PrivateKey = ${WG_CLIENT_PRIV}
+Address = ${WG_CLIENT_ADDR:-10.66.66.2/32}
+
+[Peer]
+PublicKey = ${WG_SERVER_PUB}
+AllowedIPs = ${server_ip}/32
+Endpoint = ${endpoint}
+PersistentKeepalive = 25
+EOF
+            chmod 600 "${STATE_DIR}/wg-client.conf"
+
+            cat > "${STATE_DIR}/xray-wireguard-outbound.json" <<EOF
+{
+  "tag": "wg-out",
+  "protocol": "wireguard",
+  "settings": {
+    "secretKey": "${WG_CLIENT_PRIV}",
+    "address": ["${WG_CLIENT_ADDR:-10.66.66.2/32}"],
+    "peers": [
+      {
+        "publicKey": "${WG_SERVER_PUB}",
+        "endpoint": "${endpoint}",
+        "allowedIPs": ["${server_ip}/32"],
+        "keepAlive": 25
+      }
+    ],
+    "mtu": 1420,
+    "domainStrategy": "ForceIP"
+  }
+}
+EOF
+            chmod 600 "${STATE_DIR}/xray-wireguard-outbound.json"
+
+            cat > "${STATE_DIR}/xray-wg-vless-client-example.json" <<EOF
+{
+  "log": {"loglevel": "warning"},
+  "inbounds": [{"tag": "socks-in", "listen": "127.0.0.1", "port": 10808, "protocol": "socks", "settings": {"auth": "noauth", "udp": true}}],
+  "outbounds": [
+    {
+      "tag": "proxy",
+      "protocol": "vless",
+      "settings": {"vnext": [{"address": "${server_ip}", "port": 443, "users": [{"id": "USER_UUID_FROM_SUBSCRIPTION", "encryption": "none", "flow": "xtls-rprx-vision"}]}]},
+      "streamSettings": {
+        "network": "raw",
+        "security": "reality",
+        "realitySettings": {"serverName": "CURRENT_SNI_FROM_HOST", "fingerprint": "${DEFAULT_FP:-randomized}", "publicKey": "${REALITY_PUB_TCP:-REALITY_PUBLIC_KEY}", "shortId": "${SHORT_ID_TCP:-SHORT_ID}", "spiderX": ""},
+        "sockopt": {"dialerProxy": "wg-out"}
+      }
+    },
+    {
+      "tag": "wg-out",
+      "protocol": "wireguard",
+      "settings": {
+        "secretKey": "${WG_CLIENT_PRIV}",
+        "address": ["${WG_CLIENT_ADDR:-10.66.66.2/32}"],
+        "peers": [{"publicKey": "${WG_SERVER_PUB}", "endpoint": "${endpoint}", "allowedIPs": ["${server_ip}/32"], "keepAlive": 25}],
+        "mtu": 1420,
+        "domainStrategy": "ForceIP"
+      }
+    },
+    {"tag": "direct", "protocol": "freedom"},
+    {"tag": "block", "protocol": "blackhole"}
+  ],
+  "routing": {"rules": [{"outboundTag": "proxy", "network": "tcp,udp"}]}
+}
+EOF
+            chmod 600 "${STATE_DIR}/xray-wg-vless-client-example.json"
+            echo "Refreshed WG client templates:"
+            echo "  ${STATE_DIR}/wg-client.conf"
+            echo "  ${STATE_DIR}/xray-wireguard-outbound.json"
+            echo "  ${STATE_DIR}/xray-wg-vless-client-example.json"
+            ;;
+        *) echo "Usage: nstp wg {status|client|xray|refresh}"; exit 2 ;;
     esac
 }
 
@@ -650,7 +736,7 @@ Usage:
   nstp test {reality|grpc|xhttp|all}  internal protocol probe via Xray + SOCKS
   nstp logs [node|nginx|xray|all]
   nstp cert {status|renew}
-  nstp wg   {status|client|xray}
+  nstp wg   {status|client|xray|refresh}
   nstp sni  {list|rotate|rotate-now}
   nstp fp   {show|set <fp>}
   nstp update                       docker compose pull + up -d

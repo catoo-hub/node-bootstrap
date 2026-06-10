@@ -3,7 +3,7 @@
 #  node-bootstrap.sh — Remnawave node installer (full API-driven setup)
 #  Supports: Debian 12+ / Ubuntu 22.04+  |  Requires: root
 #
-#  v1.1.1 — node creation + config-profile creation + hosts creation all via API
+#  v1.1.2 — node creation + config-profile creation + hosts creation all via API
 #
 #  Usage (interactive):     bash node-bootstrap.sh
 #  Usage (non-interactive): bash node-bootstrap.sh --country NL --hosting 1CENT ... -y
@@ -19,7 +19,7 @@ IFS=$'\n\t'
 # SECTION 1 · CONSTANTS & GLOBALS
 # ─────────────────────────────────────────────────────────────────────────────
 
-readonly SCRIPT_VERSION="1.1.1"
+readonly SCRIPT_VERSION="1.1.2"
 readonly SCRIPT_NAME="$(basename "$0")"
 LOG_FILE="/var/log/node-bootstrap.log"
 readonly STATE_DIR="/opt/web/state"
@@ -59,6 +59,7 @@ MONITOR_FROM_IP=""         # IP of the panel/Prometheus server allowed to scrape
 WITH_WG_SERVER=false       # Optional WireGuard server for BS wg-relay / Xray dialerProxy
 WG_IFACE="wg-web"
 WG_PORT="51820"
+WG_MTU="760"
 WG_SERVER_ADDR="10.66.66.1/24"
 WG_CLIENT_ADDR="10.66.66.2/32"
 WG_ALLOWED_SOURCE=""       # Optional BS relay IP allowed in UFW; empty = allow any source
@@ -66,6 +67,34 @@ WG_SERVER_PRIV=""
 WG_SERVER_PUB=""
 WG_CLIENT_PRIV=""
 WG_CLIENT_PUB=""
+
+# Optional WG bridge subscription profile.
+# Creates one VLESS/raw/Reality inbound reachable only through the generated
+# client-side WireGuard outbound. The public BS relay remains UDP-only.
+WITH_WG_BRIDGE_PROFILE=false
+WG_BRIDGE_INBOUND_TAG=""
+WG_BRIDGE_PORT="9443"
+WG_BRIDGE_TARGET="5post-gate.x5.ru:443"
+WG_BRIDGE_SERVER_NAME="5post-gate.x5.ru"
+WG_BRIDGE_TEMPLATE_UUID=""
+WG_BRIDGE_SHORT_IDS=""
+
+# Optional upstream exits for the WG bridge server config. These are intentionally
+# CLI-provided: never bake production exit credentials into this repo.
+WG_EXIT_RU_ADDRESS=""
+WG_EXIT_RU_PORT="443"
+WG_EXIT_RU_UUID=""
+WG_EXIT_RU_PBK=""
+WG_EXIT_RU_SNI=""
+WG_EXIT_RU_SID=""
+WG_EXIT_RU_FP="firefox"
+WG_EXIT_FIN_ADDRESS=""
+WG_EXIT_FIN_PORT="443"
+WG_EXIT_FIN_UUID=""
+WG_EXIT_FIN_PBK=""
+WG_EXIT_FIN_SNI=""
+WG_EXIT_FIN_SID=""
+WG_EXIT_FIN_FP="firefox"
 
 # Required params
 DOMAIN=""                  # example.com — wildcard base
@@ -483,11 +512,34 @@ STUB_NAME="${STUB_NAME}"
 WITH_WG_SERVER="${WITH_WG_SERVER}"
 WG_IFACE="${WG_IFACE}"
 WG_PORT="${WG_PORT}"
+WG_MTU="${WG_MTU}"
 WG_SERVER_ADDR="${WG_SERVER_ADDR}"
 WG_CLIENT_ADDR="${WG_CLIENT_ADDR}"
 WG_ALLOWED_SOURCE="${WG_ALLOWED_SOURCE}"
 WG_SERVER_PUB="${WG_SERVER_PUB}"
 WG_CLIENT_PUB="${WG_CLIENT_PUB}"
+
+WITH_WG_BRIDGE_PROFILE="${WITH_WG_BRIDGE_PROFILE}"
+WG_BRIDGE_INBOUND_TAG="${WG_BRIDGE_INBOUND_TAG}"
+WG_BRIDGE_PORT="${WG_BRIDGE_PORT}"
+WG_BRIDGE_TARGET="${WG_BRIDGE_TARGET}"
+WG_BRIDGE_SERVER_NAME="${WG_BRIDGE_SERVER_NAME}"
+WG_BRIDGE_TEMPLATE_UUID="${WG_BRIDGE_TEMPLATE_UUID}"
+WG_BRIDGE_SHORT_IDS="${WG_BRIDGE_SHORT_IDS}"
+WG_EXIT_RU_ADDRESS="${WG_EXIT_RU_ADDRESS}"
+WG_EXIT_RU_PORT="${WG_EXIT_RU_PORT}"
+WG_EXIT_RU_UUID="${WG_EXIT_RU_UUID}"
+WG_EXIT_RU_PBK="${WG_EXIT_RU_PBK}"
+WG_EXIT_RU_SNI="${WG_EXIT_RU_SNI}"
+WG_EXIT_RU_SID="${WG_EXIT_RU_SID}"
+WG_EXIT_RU_FP="${WG_EXIT_RU_FP}"
+WG_EXIT_FIN_ADDRESS="${WG_EXIT_FIN_ADDRESS}"
+WG_EXIT_FIN_PORT="${WG_EXIT_FIN_PORT}"
+WG_EXIT_FIN_UUID="${WG_EXIT_FIN_UUID}"
+WG_EXIT_FIN_PBK="${WG_EXIT_FIN_PBK}"
+WG_EXIT_FIN_SNI="${WG_EXIT_FIN_SNI}"
+WG_EXIT_FIN_SID="${WG_EXIT_FIN_SID}"
+WG_EXIT_FIN_FP="${WG_EXIT_FIN_FP}"
 EOF
     chmod 600 "$CONFIG_FILE"
 
@@ -574,6 +626,34 @@ panel_create_host() {
     panel_req POST /api/hosts "$1"
 }
 
+panel_upsert_xray_json_template() {
+    local template_name="$1" template_json="$2"
+    local templates uuid
+    templates="$(panel_req GET /api/subscription-templates 2>/dev/null || echo '')"
+    if [[ -n "$templates" ]]; then
+        uuid="$(echo "$templates" | jq -r --arg n "$template_name" '
+            (.response.templates // [])
+            | map(select(.name == $n and .templateType == "XRAY_JSON"))
+            | .[0].uuid // empty
+        ' 2>/dev/null || true)"
+    else
+        uuid=""
+    fi
+
+    if [[ -z "$uuid" ]]; then
+        local create_body create_resp
+        create_body="$(jq -n --arg n "$template_name" '{name: $n, templateType: "XRAY_JSON"}')"
+        create_resp="$(panel_req POST /api/subscription-templates "$create_body")" || return 1
+        uuid="$(echo "$create_resp" | jq -r '.response.uuid')"
+    fi
+
+    local patch_body
+    patch_body="$(jq -n --arg uuid "$uuid" --arg n "$template_name" --argjson t "$template_json" \
+        '{uuid: $uuid, name: $n, templateJson: $t}')"
+    panel_req PATCH /api/subscription-templates "$patch_body" >/dev/null || return 1
+    echo "$uuid"
+}
+
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 6 · PARAM COLLECTION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -582,11 +662,31 @@ collect_params() {
     log_step "Collecting installation parameters"
 
     local cli_with_wg_server="$WITH_WG_SERVER"
+    local cli_with_wg_bridge_profile="$WITH_WG_BRIDGE_PROFILE"
     local cli_wg_port="$WG_PORT"
+    local cli_wg_mtu="$WG_MTU"
     local cli_wg_iface="$WG_IFACE"
     local cli_wg_server_addr="$WG_SERVER_ADDR"
     local cli_wg_client_addr="$WG_CLIENT_ADDR"
     local cli_wg_allowed_source="$WG_ALLOWED_SOURCE"
+    local cli_wg_bridge_inbound_tag="$WG_BRIDGE_INBOUND_TAG"
+    local cli_wg_bridge_port="$WG_BRIDGE_PORT"
+    local cli_wg_bridge_target="$WG_BRIDGE_TARGET"
+    local cli_wg_bridge_server_name="$WG_BRIDGE_SERVER_NAME"
+    local cli_wg_exit_ru_address="$WG_EXIT_RU_ADDRESS"
+    local cli_wg_exit_ru_port="$WG_EXIT_RU_PORT"
+    local cli_wg_exit_ru_uuid="$WG_EXIT_RU_UUID"
+    local cli_wg_exit_ru_pbk="$WG_EXIT_RU_PBK"
+    local cli_wg_exit_ru_sni="$WG_EXIT_RU_SNI"
+    local cli_wg_exit_ru_sid="$WG_EXIT_RU_SID"
+    local cli_wg_exit_ru_fp="$WG_EXIT_RU_FP"
+    local cli_wg_exit_fin_address="$WG_EXIT_FIN_ADDRESS"
+    local cli_wg_exit_fin_port="$WG_EXIT_FIN_PORT"
+    local cli_wg_exit_fin_uuid="$WG_EXIT_FIN_UUID"
+    local cli_wg_exit_fin_pbk="$WG_EXIT_FIN_PBK"
+    local cli_wg_exit_fin_sni="$WG_EXIT_FIN_SNI"
+    local cli_wg_exit_fin_sid="$WG_EXIT_FIN_SID"
+    local cli_wg_exit_fin_fp="$WG_EXIT_FIN_FP"
 
     # 0. Resume previous values from state if present. CLI flags override these;
     #    only fields the operator didn't pass get the persisted value. Critical
@@ -597,11 +697,31 @@ collect_params() {
     fi
 
     [[ "$cli_with_wg_server" == true ]] && WITH_WG_SERVER=true
+    [[ "$cli_with_wg_bridge_profile" == true ]] && WITH_WG_BRIDGE_PROFILE=true
     [[ "$cli_wg_port" != "51820" ]] && WG_PORT="$cli_wg_port"
+    [[ "$cli_wg_mtu" != "760" ]] && WG_MTU="$cli_wg_mtu"
     [[ "$cli_wg_iface" != "wg-web" ]] && WG_IFACE="$cli_wg_iface"
     [[ "$cli_wg_server_addr" != "10.66.66.1/24" ]] && WG_SERVER_ADDR="$cli_wg_server_addr"
     [[ "$cli_wg_client_addr" != "10.66.66.2/32" ]] && WG_CLIENT_ADDR="$cli_wg_client_addr"
     [[ -n "$cli_wg_allowed_source" ]] && WG_ALLOWED_SOURCE="$cli_wg_allowed_source"
+    [[ -n "$cli_wg_bridge_inbound_tag" ]] && WG_BRIDGE_INBOUND_TAG="$cli_wg_bridge_inbound_tag"
+    [[ "$cli_wg_bridge_port" != "9443" ]] && WG_BRIDGE_PORT="$cli_wg_bridge_port"
+    [[ "$cli_wg_bridge_target" != "5post-gate.x5.ru:443" ]] && WG_BRIDGE_TARGET="$cli_wg_bridge_target"
+    [[ "$cli_wg_bridge_server_name" != "5post-gate.x5.ru" ]] && WG_BRIDGE_SERVER_NAME="$cli_wg_bridge_server_name"
+    [[ -n "$cli_wg_exit_ru_address" ]] && WG_EXIT_RU_ADDRESS="$cli_wg_exit_ru_address"
+    [[ "$cli_wg_exit_ru_port" != "443" ]] && WG_EXIT_RU_PORT="$cli_wg_exit_ru_port"
+    [[ -n "$cli_wg_exit_ru_uuid" ]] && WG_EXIT_RU_UUID="$cli_wg_exit_ru_uuid"
+    [[ -n "$cli_wg_exit_ru_pbk" ]] && WG_EXIT_RU_PBK="$cli_wg_exit_ru_pbk"
+    [[ -n "$cli_wg_exit_ru_sni" ]] && WG_EXIT_RU_SNI="$cli_wg_exit_ru_sni"
+    [[ -n "$cli_wg_exit_ru_sid" ]] && WG_EXIT_RU_SID="$cli_wg_exit_ru_sid"
+    [[ "$cli_wg_exit_ru_fp" != "firefox" ]] && WG_EXIT_RU_FP="$cli_wg_exit_ru_fp"
+    [[ -n "$cli_wg_exit_fin_address" ]] && WG_EXIT_FIN_ADDRESS="$cli_wg_exit_fin_address"
+    [[ "$cli_wg_exit_fin_port" != "443" ]] && WG_EXIT_FIN_PORT="$cli_wg_exit_fin_port"
+    [[ -n "$cli_wg_exit_fin_uuid" ]] && WG_EXIT_FIN_UUID="$cli_wg_exit_fin_uuid"
+    [[ -n "$cli_wg_exit_fin_pbk" ]] && WG_EXIT_FIN_PBK="$cli_wg_exit_fin_pbk"
+    [[ -n "$cli_wg_exit_fin_sni" ]] && WG_EXIT_FIN_SNI="$cli_wg_exit_fin_sni"
+    [[ -n "$cli_wg_exit_fin_sid" ]] && WG_EXIT_FIN_SID="$cli_wg_exit_fin_sid"
+    [[ "$cli_wg_exit_fin_fp" != "firefox" ]] && WG_EXIT_FIN_FP="$cli_wg_exit_fin_fp"
 
     # 1. DOMAIN
     if [[ -z "$DOMAIN" ]]; then
@@ -706,12 +826,26 @@ collect_params() {
         XHTTP_PATH="${XHTTP_PATH_POOL[$RANDOM % ${#XHTTP_PATH_POOL[@]}]}"
     fi
 
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        WITH_WG_SERVER=true
+        [[ -z "$WG_BRIDGE_INBOUND_TAG" ]] && WG_BRIDGE_INBOUND_TAG="${COUNTRY_CODE}-${NODE_SEQUENCE}"
+        if [[ "$WG_BRIDGE_SERVER_NAME" == "5post-gate.x5.ru" && "$WG_BRIDGE_TARGET" != "5post-gate.x5.ru:443" ]]; then
+            WG_BRIDGE_SERVER_NAME="${WG_BRIDGE_TARGET%%:*}"
+        fi
+        [[ "$WG_MTU" =~ ^[0-9]+$ ]] || { log_error "--wg-mtu must be numeric"; exit 1; }
+        [[ "$WG_BRIDGE_PORT" =~ ^[0-9]+$ ]] || { log_error "--wg-bridge-port must be numeric"; exit 1; }
+    fi
+
     log_info "DOMAIN  : ${DOMAIN}"
     log_info "NODE    : ${NODE_NAME}  $(country_flag "$COUNTRY_CODE") $(country_name "$COUNTRY_CODE")"
     log_info "TAG     : ${TAG_PREFIX}"
     log_info "PANEL   : ${PANEL_URL}"
     log_info "SNI POL : ${ACTIVE_SNIS}× active × every ${ROTATION_DAYS}d (style: ${SNI_STYLE}, fp: ${DEFAULT_FP})"
     log_info "XHTTP   : ${XHTTP_PATH}"
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        log_info "WG MODE : bridge profile ${WG_BRIDGE_INBOUND_TAG} on ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT} (mtu ${WG_MTU})"
+        log_info "WG MASK : ${WG_BRIDGE_SERVER_NAME} via ${WG_BRIDGE_TARGET}"
+    fi
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -885,6 +1019,7 @@ setup_wireguard_server() {
 Address = ${WG_SERVER_ADDR}
 ListenPort = ${WG_PORT}
 PrivateKey = ${WG_SERVER_PRIV}
+MTU = ${WG_MTU}
 SaveConfig = false
 
 [Peer]
@@ -908,12 +1043,17 @@ EOF
             ufw allow "${WG_PORT}/udp" comment 'WireGuard server' &>/dev/null || true
             log_info "UFW: allowed WireGuard UDP ${WG_PORT} from any source"
         fi
+        if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+            ufw allow in on "$WG_IFACE" to any port "$WG_BRIDGE_PORT" proto tcp comment 'WG VLESS bridge' &>/dev/null || true
+            log_info "UFW: allowed bridge TCP ${WG_BRIDGE_PORT} on ${WG_IFACE}"
+        fi
     fi
 
     cat > "${STATE_DIR}/wg-client.conf" <<EOF
 [Interface]
 PrivateKey = ${WG_CLIENT_PRIV}
 Address = ${WG_CLIENT_ADDR}
+MTU = ${WG_MTU}
 
 [Peer]
 PublicKey = ${WG_SERVER_PUB}
@@ -938,7 +1078,7 @@ EOF
         "keepAlive": 25
       }
     ],
-    "mtu": 1420,
+    "mtu": ${WG_MTU},
     "domainStrategy": "ForceIP"
   }
 }
@@ -1010,7 +1150,7 @@ EOF
             "keepAlive": 25
           }
         ],
-        "mtu": 1420,
+        "mtu": ${WG_MTU},
         "domainStrategy": "ForceIP"
       }
     },
@@ -1693,6 +1833,9 @@ generate_secrets() {
     local need_keys=false
     [[ -z "${REALITY_PRIV_TCP:-}" || -z "${REALITY_PUB_TCP:-}" ]] && need_keys=true
     [[ -z "${REALITY_PRIV_GRPC:-}" || -z "${REALITY_PUB_GRPC:-}" ]] && need_keys=true
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true && -z "${WG_BRIDGE_SHORT_IDS:-}" ]]; then
+        need_keys=true
+    fi
     if [[ "$need_keys" != true \
        && -n "${SHORT_ID_TCP:-}" && -n "${SHORT_ID_GRPC:-}" \
        && -n "${HYS_PASSWORD:-}" && -n "${HYS_OBFS_PASSWORD:-}" ]]; then
@@ -1725,6 +1868,14 @@ generate_secrets() {
     [[ -z "${HYS_OBFS_PASSWORD:-}" ]] && HYS_OBFS_PASSWORD="$(gen_password)"
     [[ -z "${SHORT_ID_TCP:-}" ]]      && SHORT_ID_TCP="$(openssl rand -hex 8)"
     [[ -z "${SHORT_ID_GRPC:-}" ]]     && SHORT_ID_GRPC="$(openssl rand -hex 8)"
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true && -z "${WG_BRIDGE_SHORT_IDS:-}" ]]; then
+        WG_BRIDGE_SHORT_IDS="$(printf '%s,%s,%s,%s,%s' \
+            "$(openssl rand -hex 8)" \
+            "$(openssl rand -hex 8)" \
+            "$(openssl rand -hex 3)" \
+            "$(openssl rand -hex 2)" \
+            "$(openssl rand -hex 8)")"
+    fi
 
     log_ok "Secrets generated"
     STEP_STATUS["secrets"]="OK"
@@ -1733,6 +1884,164 @@ generate_secrets() {
 # ─────────────────────────────────────────────────────────────────────────────
 # SECTION 12 · BUILD XRAY CONFIG JSON (template based on user-provided example)
 # ─────────────────────────────────────────────────────────────────────────────
+
+build_wg_bridge_xray_config() {
+    local tag="${WG_BRIDGE_INBOUND_TAG}"
+    local ru_enabled=false fin_enabled=false
+    [[ -n "$WG_EXIT_RU_ADDRESS" && -n "$WG_EXIT_RU_UUID" && -n "$WG_EXIT_RU_PBK" && -n "$WG_EXIT_RU_SNI" ]] && ru_enabled=true
+    [[ -n "$WG_EXIT_FIN_ADDRESS" && -n "$WG_EXIT_FIN_UUID" && -n "$WG_EXIT_FIN_PBK" && -n "$WG_EXIT_FIN_SNI" ]] && fin_enabled=true
+
+    jq -n \
+        --arg tag "$tag" --argjson port "$WG_BRIDGE_PORT" \
+        --arg target "$WG_BRIDGE_TARGET" --arg server_name "$WG_BRIDGE_SERVER_NAME" \
+        --arg priv "$REALITY_PRIV_TCP" --arg pub "$REALITY_PUB_TCP" \
+        --arg short_ids "$WG_BRIDGE_SHORT_IDS" \
+        --arg ru_addr "$WG_EXIT_RU_ADDRESS" --argjson ru_port "$WG_EXIT_RU_PORT" --arg ru_uuid "$WG_EXIT_RU_UUID" \
+        --arg ru_pbk "$WG_EXIT_RU_PBK" --arg ru_sni "$WG_EXIT_RU_SNI" --arg ru_sid "$WG_EXIT_RU_SID" --arg ru_fp "$WG_EXIT_RU_FP" \
+        --arg fin_addr "$WG_EXIT_FIN_ADDRESS" --argjson fin_port "$WG_EXIT_FIN_PORT" --arg fin_uuid "$WG_EXIT_FIN_UUID" \
+        --arg fin_pbk "$WG_EXIT_FIN_PBK" --arg fin_sni "$WG_EXIT_FIN_SNI" --arg fin_sid "$WG_EXIT_FIN_SID" --arg fin_fp "$WG_EXIT_FIN_FP" \
+        --argjson ru_enabled "$ru_enabled" --argjson fin_enabled "$fin_enabled" \
+'def exit_out($tag; $address; $port; $uuid; $pbk; $sni; $sid; $fp):
+  {
+    mux: {enabled: false, concurrency: -1},
+    tag: $tag,
+    protocol: "vless",
+    settings: {
+      vnext: [{
+        address: $address,
+        port: $port,
+        users: [{
+          id: $uuid,
+          flow: "xtls-rprx-vision",
+          email: "t@t.tt",
+          alterId: 0,
+          security: "auto",
+          encryption: "none"
+        }]
+      }]
+    },
+    streamSettings: {
+      network: "tcp",
+      security: "reality",
+      realitySettings: {
+        show: false,
+        shortId: $sid,
+        spiderX: "",
+        publicKey: $pbk,
+        serverName: $sni,
+        fingerprint: $fp
+      }
+    }
+  };
+{
+  log: {
+    access: "/var/log/remnanode/access.log",
+    loglevel: "info"
+  },
+  inbounds: [
+    {
+      tag: $tag,
+      port: $port,
+      listen: "0.0.0.0",
+      protocol: "vless",
+      settings: {
+        clients: [],
+        decryption: "none"
+      },
+      sniffing: {
+        enabled: true,
+        destOverride: ["http", "tls", "quic"]
+      },
+      streamSettings: {
+        network: "raw",
+        security: "reality",
+        realitySettings: {
+          show: false,
+          xver: 0,
+          target: $target,
+          shortIds: ($short_ids | split(",")),
+          publicKey: $pub,
+          privateKey: $priv,
+          serverNames: [$server_name]
+        }
+      }
+    }
+  ],
+  outbounds:
+    ([{tag: "DIRECT", protocol: "freedom"},
+      {tag: "BLOCK", protocol: "blackhole"},
+      {tag: "EXIT", protocol: "freedom"}]
+     + (if $ru_enabled then [exit_out(($tag + "-EXIT-RU"); $ru_addr; $ru_port; $ru_uuid; $ru_pbk; $ru_sni; $ru_sid; $ru_fp)] else [] end)
+     + (if $fin_enabled then [exit_out(($tag + "-EXIT-FIN"); $fin_addr; $fin_port; $fin_uuid; $fin_pbk; $fin_sni; $fin_sid; $fin_fp)] else [] end)),
+  routing: {
+    rules: [
+      {ip: ["geoip:private"], type: "field", outboundTag: "BLOCK"},
+      {type: "field", protocol: ["bittorrent"], outboundTag: "BLOCK"}
+    ]
+  }
+}'
+}
+
+build_wg_bridge_xray_template() {
+    local server_ip="${WG_SERVER_ADDR%%/*}"
+    local endpoint="${WG_ALLOWED_SOURCE:-BS_RELAY_IP}:${WG_PORT}"
+    jq -n \
+        --arg secret "$WG_CLIENT_PRIV" --arg client_addr "$WG_CLIENT_ADDR" \
+        --arg pub "$WG_SERVER_PUB" --arg endpoint "$endpoint" --arg allowed "${server_ip}/32" \
+        --argjson mtu "$WG_MTU" \
+'{
+  dns: {
+    servers: ["1.1.1.1", "1.0.0.1"],
+    queryStrategy: "UseIP"
+  },
+  routing: {
+    rules: [
+      {type: "field", protocol: ["bittorrent"], outboundTag: "direct"},
+      {network: "tcp,udp", outboundTag: "proxy"}
+    ],
+    domainMatcher: "hybrid",
+    domainStrategy: "IPIfNonMatch"
+  },
+  inbounds: [
+    {
+      tag: "socks",
+      port: 10808,
+      listen: "127.0.0.1",
+      protocol: "socks",
+      settings: {udp: true, auth: "noauth"},
+      sniffing: {enabled: true, routeOnly: false, destOverride: ["http", "tls", "quic"]}
+    },
+    {
+      tag: "http",
+      port: 10809,
+      listen: "127.0.0.1",
+      protocol: "http",
+      settings: {allowTransparent: false},
+      sniffing: {enabled: true, routeOnly: false, destOverride: ["http", "tls", "quic"]}
+    }
+  ],
+  outbounds: [
+    {
+      tag: "wg-out",
+      protocol: "wireguard",
+      settings: {
+        mtu: $mtu,
+        peers: [{
+          endpoint: $endpoint,
+          keepAlive: 25,
+          publicKey: $pub,
+          allowedIPs: [$allowed]
+        }],
+        address: [$client_addr],
+        secretKey: $secret,
+        domainStrategy: "ForceIP"
+      }
+    },
+    {tag: "direct", protocol: "freedom"},
+    {tag: "block", protocol: "blackhole"}
+  ]
+}'
+}
 
 # Args: $1 — initial SNI string
 build_xray_config() {
@@ -1903,9 +2212,17 @@ setup_panel_resources() {
     log_ok "Got panel pubKey ($(echo -n "$NODE_SECRET_KEY" | wc -c) chars)"
 
     # 2. Build Xray config + create config-profile
-    local initial_sni; initial_sni="$(generate_initial_sni)"
-    log_info "Initial SNI: ${initial_sni}"
-    local xray_cfg; xray_cfg="$(build_xray_config "$initial_sni")"
+    local initial_sni="" expected_inbounds=4
+    local xray_cfg
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        expected_inbounds=1
+        xray_cfg="$(build_wg_bridge_xray_config)"
+        log_info "WG bridge inbound: ${WG_BRIDGE_INBOUND_TAG} (${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT})"
+    else
+        initial_sni="$(generate_initial_sni)"
+        log_info "Initial SNI: ${initial_sni}"
+        xray_cfg="$(build_xray_config "$initial_sni")"
+    fi
 
     local profile_name="${NODE_NAME}"
     log_info "Creating config-profile '${profile_name}'..."
@@ -1928,8 +2245,8 @@ setup_panel_resources() {
     local inbounds_count; inbounds_count="$(echo "$inbounds" | jq 'length')"
     log_info "Profile has ${inbounds_count} inbounds"
 
-    if [[ "$inbounds_count" -lt 4 ]]; then
-        log_error "Expected 4 inbounds, got ${inbounds_count}. Dumping response structure for debugging:"
+    if [[ "$inbounds_count" -lt "$expected_inbounds" ]]; then
+        log_error "Expected ${expected_inbounds} inbounds, got ${inbounds_count}. Dumping response structure for debugging:"
         echo "$cp_full" | jq '. | {response_keys: (.response | keys), inbounds_at_response: (.response.inbounds // null | length), inbounds_at_config: (.response.config.inbounds // null | length), first_inbound_sample: (.response.inbounds[0] // .response.config.inbounds[0] // null)}' | sed 's/^/    [debug] /' >&2
         STEP_STATUS["panel"]="FAILED"
         return 1
@@ -1950,7 +2267,20 @@ setup_panel_resources() {
     fi
 
     # Final sanity check — make sure every slot ended up with a real UUID
-    for slot in REALITY GRPC XHTTP HYS; do
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        NODE_INBOUND_REALITY_UUID="$(echo "$inbounds" | jq -r --arg t "$WG_BRIDGE_INBOUND_TAG" '.[] | select(.tag == $t) | .uuid' | head -1)"
+        if [[ -z "$NODE_INBOUND_REALITY_UUID" || "$NODE_INBOUND_REALITY_UUID" == "null" ]]; then
+            log_warn "Could not match bridge inbound by tag; falling back to first inbound"
+            NODE_INBOUND_REALITY_UUID="$(echo "$inbounds" | jq -r '.[0].uuid')"
+        fi
+        NODE_INBOUND_GRPC_UUID=""
+        NODE_INBOUND_XHTTP_UUID=""
+        NODE_INBOUND_HYS_UUID=""
+    fi
+
+    local required_slots=(REALITY)
+    [[ "$WITH_WG_BRIDGE_PROFILE" == false ]] && required_slots=(REALITY GRPC XHTTP HYS)
+    for slot in "${required_slots[@]}"; do
         local var="NODE_INBOUND_${slot}_UUID"
         local val="${!var}"
         if [[ -z "$val" || "$val" == "null" ]]; then
@@ -1966,6 +2296,12 @@ setup_panel_resources() {
 
     # 4. Create node in panel
     log_info "Registering node '${NODE_NAME}' in panel..."
+    local active_inbounds
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        active_inbounds="$(jq -n --arg a "$NODE_INBOUND_REALITY_UUID" '[$a]')"
+    else
+        active_inbounds="$(jq -n --arg a "$NODE_INBOUND_REALITY_UUID" --arg b "$NODE_INBOUND_GRPC_UUID" --arg c "$NODE_INBOUND_XHTTP_UUID" --arg d "$NODE_INBOUND_HYS_UUID" '[$a,$b,$c,$d]')"
+    fi
     local node_body
     node_body="$(jq -n \
         --arg name "$NODE_NAME" \
@@ -1973,7 +2309,7 @@ setup_panel_resources() {
         --arg cc "$COUNTRY_CODE" \
         --argjson port "$NODE_PORT" \
         --arg cp "$CONFIG_PROFILE_UUID" \
-        --argjson inbounds "$(jq -n --arg a "$NODE_INBOUND_REALITY_UUID" --arg b "$NODE_INBOUND_GRPC_UUID" --arg c "$NODE_INBOUND_XHTTP_UUID" --arg d "$NODE_INBOUND_HYS_UUID" '[$a,$b,$c,$d]')" \
+        --argjson inbounds "$active_inbounds" \
         --arg tag "$(echo "${TAG_PREFIX}" | tr -c 'A-Z0-9_:' '_' | head -c 36)" \
         '{
             name: $name,
@@ -1992,14 +2328,14 @@ setup_panel_resources() {
     NODE_UUID="$(echo "$node_resp" | jq -r '.response.uuid')"
     log_ok "Node UUID: ${NODE_UUID}"
 
-    # Verify the node actually got the 4 activeInbounds we sent. The panel will
+    # Verify the node actually got the activeInbounds we sent. The panel will
     # sometimes silently accept a malformed POST and create the node with an
     # empty activeInbounds array — which then ships an empty Xray config to
     # the container, and Xray binds nothing. This catches that early.
     local node_check; node_check="$(panel_req GET "/api/nodes/${NODE_UUID}" 2>/dev/null || echo '')"
     local active_count; active_count="$(echo "$node_check" | jq '[.response.configProfile.activeInbounds[]?] | length' 2>/dev/null || echo 0)"
-    if [[ "$active_count" -lt 4 ]]; then
-        log_error "Node was created but configProfile.activeInbounds has only ${active_count} entries (expected 4)."
+    if [[ "$active_count" -lt "$expected_inbounds" ]]; then
+        log_error "Node was created but configProfile.activeInbounds has only ${active_count} entries (expected ${expected_inbounds})."
         log_error "This means Xray will start with no listeners. The node is unusable."
         log_error "Node body sent to panel was:"
         echo "$node_body" | jq '.configProfile' | sed 's/^/    [sent] /' >&2
@@ -2065,8 +2401,79 @@ _sockopt_params_json() {
 JSON
 }
 
+_wg_bridge_sockopt_json() {
+    cat <<'JSON'
+{
+  "dialerProxy": "wg-out"
+}
+JSON
+}
+
+setup_wg_bridge_host() {
+    log_step "Creating WG bridge template + host in panel"
+    [[ "$DRY_RUN" == true ]] && { log_dry "POST/PATCH /api/subscription-templates + POST /api/hosts"; STEP_STATUS["hosts"]="DRY"; return 0; }
+
+    local server_ip="${WG_SERVER_ADDR%%/*}"
+    local template_json; template_json="$(build_wg_bridge_xray_template)"
+    log_info "Creating/updating XRAY_JSON template '${NODE_NAME}'..."
+    WG_BRIDGE_TEMPLATE_UUID="$(panel_upsert_xray_json_template "$NODE_NAME" "$template_json")" || {
+        log_error "Failed to create/update XRAY_JSON subscription template"
+        STEP_STATUS["hosts"]="FAILED"
+        return 1
+    }
+
+    mkdir -p "$STATE_DIR"
+    printf '%s\n' "$template_json" > "${STATE_DIR}/xray-wg-bridge-template.json"
+    chmod 600 "${STATE_DIR}/xray-wg-bridge-template.json"
+
+    local flag; flag="$(country_flag "$COUNTRY_CODE")"
+    local remark="[${NODE_NAME}] ${flag} LTE"
+    (( ${#remark} > 32 )) && remark="[${NODE_NAME}] LTE"
+    (( ${#remark} > 32 )) && remark="${NODE_NAME} LTE"
+
+    local sockopt body resp
+    sockopt="$(_wg_bridge_sockopt_json)"
+    body="$(jq -n \
+        --arg cp "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
+        --arg remark "$remark" --arg addr "$server_ip" \
+        --argjson port "$WG_BRIDGE_PORT" \
+        --arg sni "$WG_BRIDGE_SERVER_NAME" --arg fp "$DEFAULT_FP" \
+        --arg tag "ROUTING_HOST" --arg node "$NODE_UUID" \
+        --arg tpl "$WG_BRIDGE_TEMPLATE_UUID" \
+        --argjson sockopt "$sockopt" \
+        '{inbound:{configProfileUuid:$cp,configProfileInboundUuid:$ib},
+          remark:$remark, address:$addr, port:$port,
+          sni:$sni,
+          fingerprint:$fp, tag:$tag,
+          securityLayer:"DEFAULT",
+          xrayJsonTemplateUuid:$tpl,
+          sockoptParams:$sockopt,
+          nodes:[$node]}')"
+    resp="$(panel_create_host "$body")" || { log_error "Failed to create WG bridge host"; STEP_STATUS["hosts"]="FAILED"; return 1; }
+    local h_bridge; h_bridge="$(echo "$resp" | jq -r '.response.uuid')"
+
+    jq -n --arg n "$NODE_UUID" --arg p "$CONFIG_PROFILE_UUID" --arg ib "$NODE_INBOUND_REALITY_UUID" \
+          --arg h "$h_bridge" --arg t "$WG_BRIDGE_TEMPLATE_UUID" --arg now "$(date -Iseconds)" \
+        '{
+            node_uuid: $n,
+            config_profile_uuid: $p,
+            inbound_bridge_uuid: $ib,
+            bridge_host_uuid: $h,
+            xray_json_template_uuid: $t,
+            created_at: $now
+        }' > "${STATE_DIR}/wg-bridge.json"
+    chmod 600 "${STATE_DIR}/wg-bridge.json"
+
+    log_ok "Created WG bridge host: ${h_bridge} (template ${WG_BRIDGE_TEMPLATE_UUID})"
+    STEP_STATUS["hosts"]="OK"
+}
+
 setup_initial_hosts() {
     log_step "Creating initial hosts in panel"
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        setup_wg_bridge_host
+        return $?
+    fi
     [[ "$DRY_RUN" == true ]] && { log_dry "POST /api/hosts × 4"; STEP_STATUS["hosts"]="DRY"; return 0; }
 
     local sni; sni="$(jq -r '.active_snis[0].sni' "${STATE_DIR}/sni.json")"
@@ -2285,6 +2692,12 @@ EOF
 
 install_sni_rotator() {
     log_step "Installing SNI rotator"
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        log_info "WG bridge profile uses a fixed Reality serverName; skipping SNI rotator"
+        rm -f /etc/cron.d/web-sni-rotate 2>/dev/null || true
+        STEP_STATUS["sni_rotator"]="SKIPPED(wg-bridge)"
+        return 0
+    fi
     [[ "$DRY_RUN" == true ]] && { log_dry "Install ${SNI_ROTATE_BIN} + cron"; STEP_STATUS["sni_rotator"]="DRY"; return 0; }
 
     local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || script_dir=""
@@ -2353,12 +2766,21 @@ print_summary() {
     echo -e "  ${BOLD}Panel UUID:${RESET} ${NODE_UUID}"
     echo -e "  ${BOLD}Profile:${RESET}    ${CONFIG_PROFILE_UUID}"
     if [[ "$WITH_WG_SERVER" == true ]]; then
-        echo -e "  ${BOLD}WireGuard:${RESET} ${WG_IFACE} ${WG_SERVER_ADDR} udp/${WG_PORT}"
+        echo -e "  ${BOLD}WireGuard:${RESET} ${WG_IFACE} ${WG_SERVER_ADDR} udp/${WG_PORT} mtu/${WG_MTU}"
         echo -e "  ${BOLD}WG client:${RESET} ${STATE_DIR}/wg-client.conf"
         echo -e "  ${BOLD}Xray WG:${RESET}   ${STATE_DIR}/xray-wireguard-outbound.json"
+        [[ "$WITH_WG_BRIDGE_PROFILE" == true ]] && echo -e "  ${BOLD}WG template:${RESET} ${STATE_DIR}/xray-wg-bridge-template.json"
     fi
     echo ""
     echo -e "  ${BOLD}Next:${RESET}"
+    if [[ "$WITH_WG_BRIDGE_PROFILE" == true ]]; then
+        echo "    - nstp status      -- verify everything green"
+        echo "    - nstp wg status   -- verify WireGuard server state"
+        echo "    - In panel: attach the WG bridge host to your squad(s)"
+        echo "    - Client enters through BS relay UDP, then VLESS/raw reaches ${WG_SERVER_ADDR%%/*}:${WG_BRIDGE_PORT}"
+        echo ""
+        return 0
+    fi
     echo "    • ${BOLD}nstp status${RESET}      — verify everything green"
     echo "    • ${BOLD}nstp sni list${RESET}    — current SNI + next rotation time"
     echo "    • In panel: attach hosts to your squad(s) so users see them"
@@ -2416,10 +2838,26 @@ ${BOLD}Optional:${RESET}
   --fp <fp>               default fingerprint (default: ${DEFAULT_FP})
   --with-wg-server        install WireGuard server for BS wg-relay / Xray dialerProxy
   --wg-port <p>           WireGuard UDP port on this node (default: ${WG_PORT})
+  --wg-mtu <n>            WireGuard MTU for generated server/client configs (default: ${WG_MTU})
   --wg-iface <name>       WireGuard interface name (default: ${WG_IFACE})
   --wg-server-addr <cidr> WireGuard server address (default: ${WG_SERVER_ADDR})
   --wg-client-addr <cidr> WireGuard generated client address (default: ${WG_CLIENT_ADDR})
   --wg-allow-from <ip>    only allow WireGuard UDP from this BS relay IP in UFW
+  --wg-bridge-profile     create one WG-only VLESS/raw/Reality profile + XRAY_JSON template
+  --wg-inbound-tag <tag>  bridge inbound tag (default: <CC>-<NN>)
+  --wg-bridge-port <p>    bridge VLESS port inside WG (default: ${WG_BRIDGE_PORT})
+  --wg-reality-target <h:p> bridge Reality target (default: ${WG_BRIDGE_TARGET})
+  --wg-reality-sni <host> bridge Reality serverName/SNI (default: ${WG_BRIDGE_SERVER_NAME})
+  --wg-exit-ru-address <h> optional upstream VLESS exit address for -EXIT-RU
+  --wg-exit-ru-uuid <u>   optional upstream VLESS exit UUID for -EXIT-RU
+  --wg-exit-ru-pbk <k>    optional upstream Reality public key for -EXIT-RU
+  --wg-exit-ru-sni <h>    optional upstream Reality serverName for -EXIT-RU
+  --wg-exit-ru-sid <id>   optional upstream Reality shortId for -EXIT-RU
+  --wg-exit-fin-address <h> optional upstream VLESS exit address for -EXIT-FIN
+  --wg-exit-fin-uuid <u>  optional upstream VLESS exit UUID for -EXIT-FIN
+  --wg-exit-fin-pbk <k>   optional upstream Reality public key for -EXIT-FIN
+  --wg-exit-fin-sni <h>   optional upstream Reality serverName for -EXIT-FIN
+  --wg-exit-fin-sid <id>  optional upstream Reality shortId for -EXIT-FIN
   --dry-run               simulate
   --verbose, -v           debug output
   --skip-update           skip apt update
@@ -2448,6 +2886,12 @@ ${BOLD}Examples:${RESET}
   bash ${SCRIPT_NAME} --domain node.example.com --cf-token cf_xxx \\
       --panel-url https://panel.example.com --panel-token rw_xxx \\
       --country RU --hosting 1CENT --with-wg-server --wg-allow-from <BS_RELAY_IP> -y
+
+  # WG bridge profile: client enters through BS relay UDP, then VLESS connects to 10.66.66.1:9443:
+  bash ${SCRIPT_NAME} --domain node.example.com --cf-token cf_xxx \\
+      --panel-url https://panel.example.com --panel-token rw_xxx \\
+      --country RU --hosting AEZA --with-wg-server --wg-bridge-profile \\
+      --wg-allow-from <BS_RELAY_IP> --wg-mtu 760 -y
 EOF
 }
 
@@ -2469,10 +2913,30 @@ parse_args() {
             --monitor-from)         MONITOR_FROM_IP="$2";     shift 2 ;;
             --with-wg-server)       WITH_WG_SERVER=true;      shift ;;
             --wg-port)              WG_PORT="$2";             shift 2 ;;
+            --wg-mtu)               WG_MTU="$2";              shift 2 ;;
             --wg-iface)             WG_IFACE="$2";            shift 2 ;;
             --wg-server-addr)       WG_SERVER_ADDR="$2";      shift 2 ;;
             --wg-client-addr)       WG_CLIENT_ADDR="$2";      shift 2 ;;
             --wg-allow-from)        WG_ALLOWED_SOURCE="$2";   shift 2 ;;
+            --wg-bridge-profile)    WITH_WG_BRIDGE_PROFILE=true; shift ;;
+            --wg-inbound-tag)       WG_BRIDGE_INBOUND_TAG="$2"; shift 2 ;;
+            --wg-bridge-port)       WG_BRIDGE_PORT="$2";      shift 2 ;;
+            --wg-reality-target)    WG_BRIDGE_TARGET="$2";    shift 2 ;;
+            --wg-reality-sni)       WG_BRIDGE_SERVER_NAME="$2"; shift 2 ;;
+            --wg-exit-ru-address)   WG_EXIT_RU_ADDRESS="$2";  shift 2 ;;
+            --wg-exit-ru-port)      WG_EXIT_RU_PORT="$2";     shift 2 ;;
+            --wg-exit-ru-uuid)      WG_EXIT_RU_UUID="$2";     shift 2 ;;
+            --wg-exit-ru-pbk)       WG_EXIT_RU_PBK="$2";      shift 2 ;;
+            --wg-exit-ru-sni)       WG_EXIT_RU_SNI="$2";      shift 2 ;;
+            --wg-exit-ru-sid)       WG_EXIT_RU_SID="$2";      shift 2 ;;
+            --wg-exit-ru-fp)        WG_EXIT_RU_FP="$2";       shift 2 ;;
+            --wg-exit-fin-address)  WG_EXIT_FIN_ADDRESS="$2"; shift 2 ;;
+            --wg-exit-fin-port)     WG_EXIT_FIN_PORT="$2";    shift 2 ;;
+            --wg-exit-fin-uuid)     WG_EXIT_FIN_UUID="$2";    shift 2 ;;
+            --wg-exit-fin-pbk)      WG_EXIT_FIN_PBK="$2";     shift 2 ;;
+            --wg-exit-fin-sni)      WG_EXIT_FIN_SNI="$2";     shift 2 ;;
+            --wg-exit-fin-sid)      WG_EXIT_FIN_SID="$2";     shift 2 ;;
+            --wg-exit-fin-fp)       WG_EXIT_FIN_FP="$2";      shift 2 ;;
             --existing-node)        USE_EXISTING_NODE=true;   shift ;;
             --existing-node-uuid)   EXISTING_NODE_UUID="$2";  shift 2 ;;
             --node-key)             NODE_SECRET_KEY="$2";     shift 2 ;;

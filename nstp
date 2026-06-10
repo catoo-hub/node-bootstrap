@@ -172,6 +172,7 @@ cmd_wg() {
 [Interface]
 PrivateKey = ${WG_CLIENT_PRIV}
 Address = ${WG_CLIENT_ADDR:-10.66.66.2/32}
+MTU = ${WG_MTU:-760}
 
 [Peer]
 PublicKey = ${WG_SERVER_PUB}
@@ -196,7 +197,7 @@ EOF
         "keepAlive": 25
       }
     ],
-    "mtu": 1420,
+    "mtu": ${WG_MTU:-760},
     "domainStrategy": "ForceIP"
   }
 }
@@ -226,7 +227,7 @@ EOF
         "secretKey": "${WG_CLIENT_PRIV}",
         "address": ["${WG_CLIENT_ADDR:-10.66.66.2/32}"],
         "peers": [{"publicKey": "${WG_SERVER_PUB}", "endpoint": "${endpoint}", "allowedIPs": ["${server_ip}/32"], "keepAlive": 25}],
-        "mtu": 1420,
+        "mtu": ${WG_MTU:-760},
         "domainStrategy": "ForceIP"
       }
     },

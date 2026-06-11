@@ -1076,6 +1076,7 @@ setup_wireguard_server() {
     local client_ip="${WG_CLIENT_ADDR%%/*}"
     local conf="/etc/wireguard/${WG_IFACE}.conf"
 
+    systemctl stop "wg-quick@${WG_IFACE}" 2>/dev/null || true
     backup_file "$conf"
     cat > "$conf" <<EOF
 [Interface]
